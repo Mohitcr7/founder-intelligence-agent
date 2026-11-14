@@ -5,14 +5,19 @@
     python -m founder_agent.cli contradictions
     python -m founder_agent.cli ledger
     python -m founder_agent.cli audit <trace_id>
+    python -m founder_agent.cli attention              # approve / decide / fyi queues
+    python -m founder_agent.cli ingest <channel> <file.md> [--token T]
     python -m founder_agent.cli serve
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import sys
+import tempfile
+from pathlib import Path
 
 from .app import build_system
 from .authorization import AuthorizationError, Principal
@@ -94,6 +99,31 @@ def cmd_verify(system, _args) -> int:
     return 0
 
 
+def cmd_attention(system, _args) -> int:
+    for queue, items in system.attention().items():
+        print(f"\n{BOLD}{queue.upper()} ({len(items)}){OFF}")
+        for i in items:
+            print(f"  - {i['title']}  {DIM}{i['sources']}{OFF}")
+            if i.get("governs_today"):
+                print(f"    {DIM}{i['governs_today']}{OFF}")
+    return 0
+
+
+def cmd_ingest(system, args) -> int:
+    expected = system.settings.connector_tokens.get(args.channel, "")
+    if args.channel != "upload" and not (args.token and expected
+                                         and hmac.compare_digest(args.token, expected)):
+        print(f"{RED}refused:{OFF} channel '{args.channel}' needs its connector credential (--token)")
+        return 2
+    doc = system.ingest(Path(args.path).read_text(encoding="utf-8"), channel=args.channel,
+                        filed_by=args.filed_by)
+    print(f"{doc.doc_id}: channel={doc.channel} authority={doc.authority.value} "
+          f"governs={doc.doc_id in system.ledger.entries} quarantined={doc.quarantined}")
+    for n in doc.provenance_notes:
+        print(f"  {YEL}·{OFF} {n}")
+    return 0
+
+
 def cmd_serve(_system, args) -> int:
     import uvicorn
     uvicorn.run("founder_agent.api:app", host=args.host, port=args.port, reload=False)
@@ -136,7 +166,7 @@ def cmd_demo(system, _args) -> int:
 
     _h("2.5  AGENT DELEGATION - parent delegates, subordinates return typed results")
     for d in resp.delegations:
-        print(f"\n{BOLD}{d.agent}{OFF}  status={d.status} confidence={d.confidence} "
+        print(f"\n{BOLD}{d.agent}{OFF}  status={d.status} confidence={d.confidence:.2f} "
               f"provider={d.provider}/{d.model}")
         print(f"  task      : {d.task}")
         print(f"  summary   : {d.summary}")
@@ -146,10 +176,15 @@ def cmd_demo(system, _args) -> int:
             print(f"  {YEL}refused   : {r}{OFF}")
 
     _h("2.6  HUMAN AUTHORIZATION - prepared, then blocked until a human approves")
-    action = system.orchestrator.ask(
-        "Send Northbridge Bank our current custody position of record",
-        prepare_action=True).pending_action
+    human = Principal(kind="human", id="founder", token=system.settings.approver_token)
+    ask = system.orchestrator.ask("Send Northbridge Bank our current custody position of record",
+                                  prepare_action=True)
+    action = ask.pending_action
+    if action is None:
+        print(f"{YEL}no action prepared:{OFF} {ask.answer.caveats[-1]}")
+        return 0
     print(f"prepared  : {action.action_id}  status={action.status.value}")
+    print(f"cites     : {action.supporting_claim_ids}  (cleared for external release only)")
     print(f"intent    : {action.intent}")
     print(f"hash      : {action.payload_hash}")
     for w in action.warnings:
@@ -166,18 +201,16 @@ def cmd_demo(system, _args) -> int:
 
     print(f"\n{BOLD}attempt 2 - execute without approval{OFF}")
     try:
-        system.gateway.execute(action.action_id, Principal(kind="human", id="founder"))
+        system.gateway.execute(action.action_id, human)
         print(f"  {RED}FAILED: executed without approval{OFF}")
     except AuthorizationError as exc:
         print(f"  {GRN}refused:{OFF} {exc}")
 
     print(f"\n{BOLD}attempt 3 - a human approves, then the payload is tampered with{OFF}")
-    system.gateway.approve(action.action_id,
-                           Principal(kind="human", id="founder",
-                                     token=system.settings.approver_token))
+    system.gateway.approve(action.action_id, human)
     action.payload["to"] = "attacker@evil.invalid"
     try:
-        system.gateway.execute(action.action_id, Principal(kind="human", id="founder"))
+        system.gateway.execute(action.action_id, human)
         print(f"  {RED}FAILED: tampered payload executed{OFF}")
     except AuthorizationError as exc:
         print(f"  {GRN}refused:{OFF} {exc}")
@@ -189,7 +222,31 @@ def cmd_demo(system, _args) -> int:
         print(f"  #{e['seq']:<4} {e['ts'][11:19]}  {e['actor']:<28} {e['event']}")
     print(f"\nchain verification: {system.audit.verify()}")
     print(f"{DIM}Secrets are redacted before the write, so the log cannot leak them later.{OFF}")
+
+    _demo_provenance()
     return 0
+
+
+def _demo_provenance() -> None:
+    _h("PROVENANCE - authority comes from the intake channel, not the file")
+    from .config import Settings
+    with tempfile.TemporaryDirectory() as tmp:          # scratch system; var/ untouched
+        var = Path(tmp)
+        scratch = build_system(Settings(var_dir=var, audit_path=var / "audit.jsonl",
+                                        actions_path=var / "actions.jsonl",
+                                        intake_dir=var / "intake",
+                                        audit_anchor_path=var / "anchor.jsonl"))
+        note = ("---\ndoc_id: {id}\ntitle: \"Board Resolution: Custody\"\ndoc_type: decision\n"
+                "authority: board\ndate: 2026-09-15\ntopics: [custody, vendor, keyforge]\n---\n\n"
+                "Decision: The board approved KeyForge as a second custody provider alongside "
+                "ColdVault, effective immediately.\n")
+        governing = lambda: scratch.ledger.lookup("custody", ["DOC-01"]).governing.doc_id  # noqa: E731
+        for doc_id, channel in (("DOC-81", "upload"), ("DOC-82", "board")):
+            doc = scratch.ingest(note.format(id=doc_id), channel=channel, filed_by="demo")
+            print(f"\n{BOLD}same note, filed via '{channel}'{OFF} -> {doc_id}")
+            print(f"  declared authority : {doc.declared_authority}")
+            print(f"  assigned authority : {doc.authority.value}   quarantined={doc.quarantined}")
+            print(f"  custody governed by: {governing()}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -202,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("ledger").set_defaults(fn=cmd_ledger)
     sub.add_parser("demo").set_defaults(fn=cmd_demo)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
+    sub.add_parser("attention").set_defaults(fn=cmd_attention)
+    p = sub.add_parser("ingest"); p.add_argument("channel"); p.add_argument("path")
+    p.add_argument("--token"); p.add_argument("--filed-by", default="cli-operator")
+    p.set_defaults(fn=cmd_ingest)
     p = sub.add_parser("audit"); p.add_argument("trace_id"); p.set_defaults(fn=cmd_audit)
     p = sub.add_parser("serve")
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8000)

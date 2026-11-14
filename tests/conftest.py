@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -11,26 +12,44 @@ import pytest
 if os.environ.get("FA_LIVE") != "1":
     for _k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         os.environ.pop(_k, None)
+# Nothing a test does may land in the developer's var/ - including the module-
+# level system that founder_agent.api builds on import.
+os.environ["FA_VAR_DIR"] = tempfile.mkdtemp(prefix="fa-test-var-")
+os.environ.pop("FA_ENV", None)
 
-from founder_agent.app import build_system
-from founder_agent.config import ROOT, Settings
+from founder_agent.app import build_system  # noqa: E402
+from founder_agent.config import ROOT, Settings  # noqa: E402
 
 
 @pytest.fixture(scope="session")
-def settings(tmp_path_factory) -> Settings:
-    """A system with its own audit/action stores, so tests never touch var/."""
-    var = tmp_path_factory.mktemp("var")
-    s = Settings()
-    s.corpus_dir = ROOT / "corpus"
-    s.audit_path = var / "audit.jsonl"
-    s.actions_path = var / "actions.jsonl"
-    s.ensure_dirs()
-    return s
+def make_settings(tmp_path_factory):
+    """Settings with private audit, action, anchor and intake stores."""
+    def _make(corpus_dir: Path | None = None, **overrides) -> Settings:
+        var = tmp_path_factory.mktemp("var")
+        s = Settings(corpus_dir=corpus_dir or ROOT / "corpus", var_dir=var,
+                     audit_path=var / "audit.jsonl", actions_path=var / "actions.jsonl",
+                     intake_dir=var / "intake", audit_anchor_path=var / "anchor" / "heads.jsonl")
+        for key, value in overrides.items():
+            setattr(s, key, value)
+        s.ensure_dirs()
+        return s
+    return _make
+
+
+@pytest.fixture(scope="session")
+def settings(make_settings) -> Settings:
+    return make_settings()
 
 
 @pytest.fixture(scope="session")
 def system(settings):
     return build_system(settings)
+
+
+@pytest.fixture()
+def fresh_system(make_settings):
+    """A system nobody else has touched - for tests that ingest or mutate."""
+    return build_system(make_settings())
 
 
 @pytest.fixture()

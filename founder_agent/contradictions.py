@@ -24,7 +24,7 @@ from .schemas import (
     Evidence,
 )
 from .schemas import ContradictionCluster
-from .stance import quantities, stances_of
+from .stance import AXES, quantities, stances_of
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
@@ -70,6 +70,13 @@ def _ev(claim: Claim, *, caveat: str | None = None) -> Evidence:
     )
 
 
+def _different_subjects(a: Claim, b: Claim) -> bool:
+    """Both claims sit on an axis, but about different things on it."""
+    sa = {s.axis.name: s.subject for s in stances_of(a, assertive_only=False)}
+    sb = {s.axis.name: s.subject for s in stances_of(b, assertive_only=False)}
+    return any(sa[k] != sb[k] for k in sa.keys() & sb.keys())
+
+
 def _cid(kind: str, a: str, b: str) -> str:
     digest = hashlib.sha256(f"{kind}|{a}|{b}".encode()).hexdigest()[:8]
     return f"ctr_{digest}"
@@ -100,7 +107,10 @@ class ContradictionDetector:
         documents: dict[str, object] | None = None,
         ledger: object | None = None,
     ) -> None:
-        self.claims = claims
+        # Quarantined text (injection-shaped, tainted, or of unverified
+        # provenance) is not evidence about the company, so it cannot be one
+        # side of an institutional contradiction either.
+        self.claims = [c for c in claims if not c.injection_flags]
         self.documents = documents or {}
         #: Optional decision ledger, used to state what governs today. A
         #: contradiction report that stops at "these disagree" leaves the reader
@@ -137,20 +147,27 @@ class ContradictionDetector:
         presenting the issue once.
         """
         items = contradictions if contradictions is not None else self.detect_all()
-        buckets: dict[str, list[Contradiction]] = {}
+        buckets: dict[tuple[str, str], list[Contradiction]] = {}
         for c in items:
             axis = c.detector.split(":", 1)[1].strip() if c.detector.startswith("stance axis") else c.kind
-            buckets.setdefault(axis, []).append(c)
+            buckets.setdefault((axis, c.subject), []).append(c)
 
+        defaults = {a.name: a.default_subject for a in AXES}
         clusters: list[ContradictionCluster] = []
-        for axis, group in buckets.items():
+        for (axis, subject), group in buckets.items():
             group.sort(key=lambda c: (_SEVERITY_RANK[c.severity], -c.confidence))
             primary = group[0]
             docs = sorted({d for c in group for d in (c.claim_a.doc_id, c.claim_b.doc_id)})
+            # The axis's usual subject keeps the original id and title, so
+            # existing references to a cluster stay stable.
+            named = subject and subject != defaults.get(axis)
+            key = f"{axis}:{subject}" if named else axis
             clusters.append(ContradictionCluster(
-                cluster_id=f"cl_{hashlib.sha256(axis.encode()).hexdigest()[:8]}",
+                cluster_id=f"cl_{hashlib.sha256(key.encode()).hexdigest()[:8]}",
                 axis=axis,
-                title=_CLUSTER_TITLES.get(axis, axis.replace("_", " ")),
+                subject=subject,
+                title=_CLUSTER_TITLES.get(axis, axis.replace("_", " "))
+                      + (f" ({subject.replace('_', ' ')})" if named else ""),
                 severity=primary.severity,
                 documents=docs,
                 primary=primary,
@@ -209,7 +226,7 @@ class ContradictionDetector:
             for claim_b, stance_b in indexed[i + 1:]:
                 if claim_a.doc_id == claim_b.doc_id:
                     continue
-                if stance_a.axis.name != stance_b.axis.name:
+                if stance_a.key != stance_b.key:
                     continue
                 if stance_a.position == stance_b.position:
                     continue
@@ -240,6 +257,7 @@ class ContradictionDetector:
                     ),
                     resolution=governs,
                     detector=f"stance axis: {stance_a.axis.name}",
+                    subject=stance_a.subject,
                 ))
         return out
 
@@ -253,7 +271,7 @@ class ContradictionDetector:
                 if claim_a.doc_id == claim_b.doc_id:
                     continue
                 shared_topics = set(claim_a.topics) & set(claim_b.topics)
-                if len(shared_topics) < 2:
+                if len(shared_topics) < 2 or _different_subjects(claim_a, claim_b):
                     continue
                 for va, ua in qa:
                     for vb, ub in qb:
@@ -366,13 +384,13 @@ class ContradictionDetector:
             ext_stances = stances_of(ext)
             for dec in decisions:
                 dec_stances = stances_of(dec)
-                shared_axes = ({s.axis.name for s in ext_stances}
-                               & {s.axis.name for s in dec_stances})
-                if not shared_axes:
+                shared_keys = {s.key for s in ext_stances} & {s.key for s in dec_stances}
+                if not shared_keys:
                     continue
-                axis_name = sorted(shared_axes)[0]
-                ext_pos = {s.position for s in ext_stances if s.axis.name == axis_name}
-                dec_pos = {s.position for s in dec_stances if s.axis.name == axis_name}
+                key = sorted(shared_keys)[0]
+                axis_name = key[0]
+                ext_pos = {s.position for s in ext_stances if s.key == key}
+                dec_pos = {s.position for s in dec_stances if s.key == key}
                 if not ext_pos or not dec_pos or ext_pos == dec_pos:
                     continue
                 shared = set(ext.topics) | {axis_name}

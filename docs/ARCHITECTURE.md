@@ -12,8 +12,9 @@ flowchart TB
     subgraph T[Trusted control plane]
       O[Orchestrator<br/>plans from question + structural metadata only]
       P[Planner]
-      G[ActionGateway<br/>human authorization]
+      G[ActionGateway<br/>approver credential on approve, deny, execute]
       A[(Audit log<br/>hash-chained)]
+      AN[(Anchor<br/>chain heads, separate store)]
     end
 
     subgraph R[Reasoning over untrusted data]
@@ -26,10 +27,11 @@ flowchart TB
     end
 
     subgraph I[Ingestion]
-      L[CorpusLoader]
+      CH[Intake channels<br/>trust registry: authority, can_govern, sensitivity]
+      L[CorpusLoader<br/>authority from channel, not header]
       CL[Classifier<br/>FACT/INFERENCE/HYPOTHESIS/DECISION/UNKNOWN]
       GU[Guards<br/>injection scan + trust propagation]
-      IX[(ClaimIndex<br/>BM25 over claims)]
+      IX[(ClaimIndex<br/>BM25 + embeddings over claims)]
     end
 
     subgraph M[Model layer]
@@ -44,7 +46,7 @@ flowchart TB
       EM[external_email.send<br/>consequential]
     end
 
-    DOCS[/18 documents<br/>UNTRUSTED DATA/] --> L --> CL --> GU --> IX
+    DOCS[/18 documents + live ingest<br/>UNTRUSTED DATA/] --> CH --> L --> CL --> GU --> IX
     F --> O --> P
     O --> K --> IX
     O --> D
@@ -53,7 +55,7 @@ flowchart TB
     K & S1 & S2 & S3 --> RG --> MA & MO & MD
     O -->|prepare only| G --> TR --> EM
     C -->|credential the agent never holds| G
-    O & G & S1 & S2 & S3 --> A
+    O & G & S1 & S2 & S3 --> A --> AN
 
     style DOCS fill:#4a1a1a,color:#fff
     style G fill:#1a3a1a,color:#fff
@@ -65,14 +67,14 @@ flowchart TB
 <summary>Same diagram as plain text (for readers without Mermaid)</summary>
 
 ```
-  18 DOCUMENTS  ── UNTRUSTED DATA ──────────────────────────────────┐
+  18 DOCUMENTS + /api/ingest/<channel>  ── UNTRUSTED DATA ─────────┐
         │                                                           │
         v                                                           │
   ┌─ INGESTION ─────────────────────────────────────────────┐       │
   │  CorpusLoader -> Classifier -> Guards -> ClaimIndex      │       │
-  │  (doc -> claims)  (epistemic  (injection  (BM25 over     │       │
-  │                    labels)     scan +      claims)       │       │
-  │                                taint)                    │       │
+  │  (authority     (epistemic  (injection  (BM25 +          │       │
+  │   from channel)  labels)     scan +      embeddings)     │       │
+  │                              taint)                      │       │
   └──────────────────────────┬───────────────────────────────┘       │
                              │ evidence (claim id, label, score)     │
   FOUNDER ──question──> ┌────v─────────────────────────────┐         │
@@ -105,7 +107,8 @@ flowchart TB
                                                    (consequential)
 
    EVERY step above writes to the HASH-CHAINED AUDIT LOG, secrets redacted
-   before the write, fsync'd before the action it describes may proceed.
+   before the write, fsync'd before the action it describes may proceed;
+   chain heads copied to a separate ANCHOR store.
 ```
 
 </details>
@@ -113,10 +116,13 @@ flowchart TB
 ## 2. The two boundaries that shape everything
 
 **Boundary 1 — data never becomes instruction.**
-Document text enters at ingestion and reaches exactly three places: the BM25 index,
+Document text enters at ingestion and reaches exactly three places: the claim index,
 the answer segments shown to the user, and the evidence block inside a subagent
 prompt (wrapped in `<untrusted_document>` tags). It never reaches the planner, never
-selects a tool, and never carries authority. Routing is computed from the user's own
+selects a tool, and never carries authority: a document's authority is assigned by
+the intake channel it arrived through (`config.TRUST_REGISTRY`), and the
+`authority:` line inside it is recorded as `declared_authority` and ignored (§6).
+Routing is computed from the user's own
 question plus structural metadata — document ids, epistemic labels, retrieval scores.
 This is why a poisoned document in `tests/test_security.py` cannot cause an action:
 there is no code path from document text to tool selection.
@@ -124,8 +130,11 @@ there is no code path from document text to tool selection.
 **Boundary 2 — the agent cannot authorize itself.**
 `ActionGateway.prepare()` is agent-callable. `approve()` rejects any principal whose
 `kind` is not `"human"` before it looks at anything else, then checks a credential
-held by the approval console. Execution re-derives the payload hash and refuses if it
-moved since approval. No prompt can cross this, because no prompt is consulted.
+held by the approval console. `deny()` and `execute()` demand the same credential, so
+an API caller can neither veto nor fire an action. Execution re-derives the payload
+hash and refuses if it moved since approval, persists `EXECUTING` before the send so a
+crash cannot cause a second send, and refuses outbound payloads that carry
+internal-only claims. No prompt can cross this, because no prompt is consulted.
 
 ## 3. Request lifecycle
 
@@ -133,13 +142,15 @@ moved since approval. No prompt can cross this, because no prompt is consulted.
 Founder question
   │
   ├─ audit: user_request
-  ├─ retrieval        BM25 over claims  →  evidence with scores + epistemic labels
+  ├─ retrieval        BM25 + embeddings over claims  →  evidence with scores + labels
   │                   quarantine: claims from tainted sources are removed here
   ├─ audit: retrieval (claim ids, scores, types)
   ├─ plan             intent from question wording + retrieval structure
   ├─ audit: plan
   ├─ knowledge        segments, each cited; UNKNOWN if best score < threshold
-  ├─ ledger           governing decision, status, history, proposal conflict
+  │                   or the question's subject is absent from the corpus
+  ├─ ledger           governing decision via lineage from any retrieved link,
+  │                   status, history, proposal conflict
   ├─ contradictions   clusters touching the retrieved documents
   ├─ delegation       subagents with fixed context + own tool grants
   │                   audit: delegation (agent, model, tokens, citations, refusals)
@@ -169,7 +180,7 @@ role to provider chain is configuration:
 ```bash
 FA_ROUTE_REASON=anthropic,openai,deterministic
 FA_ROUTE_RESEARCH=perplexity,openai,deterministic
-FA_ROUTE_REDTEAM=local-llama,anthropic,deterministic
+FA_ROUTE_REDTEAM=local,anthropic,deterministic     # local = FA_LOCAL_URL (Ollama, vLLM)
 ```
 
 Adding a provider is one class implementing `LLMProvider` (`available()` and
@@ -179,8 +190,11 @@ SDKs, so a provider change cannot drag a dependency tree behind it.
 
 ### 4.2 The response shape is normalised, and provenance is recorded
 
-Every provider returns `LLMResponse` with `text`, `provider`, `model`, token counts
-and `degraded`. Those land in the audit record, so an answer can always be traced to
+Every provider returns `LLMResponse` with `text`, `structured` (parsed JSON when the
+request carried a schema), `provider`, `model`, token counts and `degraded`. Answer
+synthesis asks for `{sentences: [{text, claim_ids}]}` and validates it with the same
+citation rules as prose, so a provider that ignores the schema degrades to prose
+checking, not to unchecked output. Those land in the audit record, so an answer can always be traced to
 what produced it — including "the local floor produced this, because both hosted
 providers were failing at 14:03".
 
@@ -231,6 +245,25 @@ matter for a real deployment:
 
 | Prototype | Production | Why the swap is cheap |
 |---|---|---|
-| `ClaimIndex` (BM25, in-memory) | pgvector / OpenSearch hybrid | Only `search()` is consumed; the return type is `list[Evidence]`. |
-| `AuditLog` (hash-chained JSONL) | append-only table + periodic anchor of the chain head to an external store | Interface is `record()` / `verify()` / `reconstruct()`; the chain design is already what makes an external anchor meaningful. |
-| `ActionGateway` (JSONL store) | transactional store with idempotency keys | Status transitions are already explicit and re-validated at execution. |
+| `ClaimIndex` (BM25 + hashing or HTTP embeddings, in-memory) | pgvector / OpenSearch hybrid | Only `search()` is consumed; the return type is `list[Evidence]`. `tests/eval/retrieval.jsonl` gates the swap. |
+| `AuditLog` (hash-chained JSONL + anchor file) | append-only table, anchor in object-lock storage | Interface is `record()` / `verify()` / `reconstruct()`; point `FA_AUDIT_ANCHOR` at storage this process cannot overwrite. |
+| `ActionGateway` (JSONL, fsync, `EXECUTING` state, idempotency key) | transactional store | At-most-once semantics are already in the state machine; only the storage changes. |
+| Intake (`var/intake/` + `provenance.jsonl`) | connector service with per-document signatures | `ingest(markdown, channel, filed_by)` is the only entry point. |
+
+## 6. Intake and provenance
+
+Authority is a property of the channel, kept in one ops-owned table:
+
+| Channel | Authority | Can govern | Quarantined | Default sensitivity |
+|---|---|---|---|---|
+| `board`, `founder`, `compliance`, `finance`, `engineering` | same as channel | yes | no | internal |
+| `external` | external | no | no | public |
+| `upload` | unknown | no | yes | internal |
+
+`POST /api/ingest/<channel>` takes `{"markdown": ...}`. Every channel except `upload`
+needs its own `X-Connector-Token`. In production a channel with no configured token is
+disabled. The document is stored with `channel`, `filed_by`, `received_at`,
+`declared_authority` and the assigned `authority`, then indexed, ledgered and
+clustered in-process, with no restart. Its id must match its filename and may not
+overwrite an existing document. Adding Slack, Outlook or Teams takes one row in
+`TRUST_REGISTRY` plus a connector that posts to that route.

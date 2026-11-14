@@ -9,9 +9,13 @@ explicit:
   the subordinates can reach a consequential tool at all.
 * It returns a **typed result**; free-form text never flows back into the
   parent's control path, only into its report.
-* Its citations are **validated against the claims it was given**. A citation
-  the parent did not hand over is stripped, so a subordinate cannot invent
+* Its citations are **validated against the claims it was given**, plus any
+  it fetched itself through an audited, in-grant tool call scoped to the same
+  documents. Anything else is stripped, so a subordinate cannot invent
   provenance.
+* Its tool calls go through `call_tool`, which checks the role's grant and the
+  registry before anything runs, and never runs a side-effecting tool:
+  consequential actions exist only behind the ActionGateway.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from ..guards import evidence_line, wrap_untrusted
 from ..llm.base import LLMRequest, Message
 from ..llm.registry import ProviderRegistry
 from ..schemas import Claim, DelegationRequest, DelegationResult
+from ..tools.registry import ToolPermissionError, ToolRegistry
 
 
 _LABEL_TOKEN = re.compile(r"\[(FACT|DECISION|INFERENCE|HYPOTHESIS|UNKNOWN)\]\s*")
@@ -36,10 +41,12 @@ class SubAgent(ABC):
     #: Tools this role may use. Deliberately narrow; see tools/registry.py.
     granted_tools: frozenset[str] = frozenset({"corpus.search"})
 
-    def __init__(self, registry: ProviderRegistry, audit: AuditLog, ledger=None) -> None:
+    def __init__(self, registry: ProviderRegistry, audit: AuditLog, ledger=None,
+                 tools: ToolRegistry | None = None) -> None:
         self.registry = registry
         self.audit = audit
         self.ledger = ledger
+        self.tools = tools
 
     # ------------------------------------------------------------------
     def run(self, request: DelegationRequest, claims: list[Claim]) -> DelegationResult:
@@ -63,7 +70,7 @@ class SubAgent(ABC):
             return DelegationResult(agent=self.role, task=request.task, status="error",
                                     summary=f"{type(exc).__name__}: {exc}")
 
-        allowed = {c.claim_id for c in scoped}
+        allowed = {c.claim_id for c in scoped} | set(result.tool_claim_ids)
         result.citations = [c for c in result.citations if c in allowed]
         result.refusals = refusals + result.refusals
         result.agent = self.role
@@ -87,6 +94,25 @@ class SubAgent(ABC):
     @abstractmethod
     def analyse(self, request: DelegationRequest, claims: list[Claim]) -> DelegationResult:
         ...
+
+    # ------------------------------------------------------------------
+    def call_tool(self, tool: str, payload: dict, trace_id: str) -> dict:
+        """Run a tool this role was granted. Refusals are audited and raised."""
+        spec = self.tools.get(tool) if self.tools else None
+        if tool not in self.granted_tools:
+            allowed, reason = False, f"'{tool}' is not in the grant for role '{self.role}'"
+        elif spec is None:
+            allowed, reason = False, f"unknown tool '{tool}'"
+        else:
+            allowed, reason = self.tools.authorize_call(self.role, tool)
+            if allowed and (spec.side_effecting or spec.requires_human_approval):
+                allowed, reason = False, "side-effecting tools run only through the ActionGateway"
+        self.audit.record("tool_call", trace_id=trace_id, actor=self.role, payload={
+            "tool": tool, "allowed": allowed, "reason": reason,
+            "payload": {k: v for k, v in payload.items() if k != "body"}})
+        if not allowed:
+            raise ToolPermissionError(reason)
+        return spec.handler(payload)
 
     # ------------------------------------------------------------------
     def _ask_model(self, role: str, system: str, prompt: str, claims: list[Claim],

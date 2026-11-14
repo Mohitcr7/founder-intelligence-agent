@@ -31,6 +31,10 @@ class ProviderRegistry:
             "openai": OpenAIProvider(self.settings.openai_model),
             "deterministic": DeterministicProvider(),
         }
+        if self.settings.local_url:
+            # Air-gapped option: name "local" in FA_ROUTE_* to use it.
+            self._providers["local"] = OpenAIProvider(
+                self.settings.local_model, base_url=self.settings.local_url, key_env="", name="local")
         self._tripped: dict[str, float] = {}
 
     def register(self, provider: LLMProvider) -> None:

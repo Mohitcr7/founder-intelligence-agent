@@ -23,6 +23,9 @@ def test_out_of_corpus_question_returns_unknown(system):
         answer = system.knowledge.answer(question)
         assert answer.verdict == "UNKNOWN", question
         assert answer.missing
+    # The gap names the words the founder used, not their folded index form.
+    missing = " ".join(system.knowledge.answer("What is our Series A valuation?").missing)
+    assert "series" in missing and "serie," not in missing
 
 
 def test_hypothesis_backed_answer_is_labelled_and_caveated(system):

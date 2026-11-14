@@ -5,6 +5,12 @@ rewriting every later line - the tamper becomes detectable with `verify()`
 rather than invisible. This is the control that answers "historical-record
 alteration" in the threat model; the log is written before the action it
 describes is allowed to proceed.
+
+A chain alone cannot catch someone who rewrites *every* line consistently, or
+truncates the tail. So the chain head is periodically copied to an anchor file
+that should live on storage this process cannot overwrite (WORM bucket,
+append-only mount). `verify()` then checks that every anchored head is still in
+the chain, at the same position, with the same hash.
 """
 
 from __future__ import annotations
@@ -22,11 +28,16 @@ from .guards import redact
 
 GENESIS = "0" * 64
 
+#: Events important enough to anchor immediately, whatever the interval.
+_ANCHOR_EVENTS = {"action_executed", "document_ingested"}
+
 
 class AuditLog:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, anchor_path: Path | None = None, anchor_every: int = 25) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.anchor_path = Path(anchor_path) if anchor_path else None
+        self.anchor_every = max(anchor_every, 1)
         self._lock = threading.Lock()
 
     # -- writing ---------------------------------------------------------
@@ -57,7 +68,29 @@ class AuditLog:
                 fh.write(line + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
+            if entry["seq"] % self.anchor_every == 0 or event in _ANCHOR_EVENTS:
+                self._anchor(entry)
             return entry
+
+    def anchor(self) -> dict[str, Any] | None:
+        """Copy the current head out now (call on shutdown or from a scheduler)."""
+        with self._lock:
+            prev_hash, seq = self._tail()
+            if not seq:
+                return None
+            return self._anchor({"seq": seq, "hash": prev_hash})
+
+    def _anchor(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        if self.anchor_path is None:
+            return None
+        head = {"seq": entry["seq"], "hash": entry["hash"],
+                "anchored_at": datetime.now(timezone.utc).isoformat()}
+        self.anchor_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.anchor_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(head) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return head
 
     @staticmethod
     def _hash(entry: dict[str, Any]) -> str:
@@ -91,9 +124,12 @@ class AuditLog:
                     yield json.loads(line)
 
     def verify(self) -> dict[str, Any]:
-        """Recompute the chain. Returns the first break, if any."""
+        """Recompute the chain and check it against the anchored heads."""
         prev = GENESIS
         count = 0
+        # ponytail: holds every hash in memory to match anchors; fine to
+        # millions of records, past that check anchors in one streaming pass.
+        hashes: dict[int, str] = {}
         for entry in self._iter():
             count += 1
             if entry.get("prev_hash") != prev:
@@ -103,7 +139,23 @@ class AuditLog:
                 return {"ok": False, "broken_at": entry.get("seq"), "reason": "content hash mismatch",
                         "records": count}
             prev = entry["hash"]
-        return {"ok": True, "records": count, "head": prev}
+            hashes[int(entry["seq"])] = prev
+        anchors = self._anchors()
+        for head in anchors:
+            seq = int(head["seq"])
+            if seq not in hashes:
+                return {"ok": False, "broken_at": seq, "records": count,
+                        "reason": "anchored record missing (log truncated or replaced)"}
+            if hashes[seq] != head["hash"]:
+                return {"ok": False, "broken_at": seq, "records": count,
+                        "reason": "anchored head does not match (log rewritten)"}
+        return {"ok": True, "records": count, "head": prev, "anchors_checked": len(anchors)}
+
+    def _anchors(self) -> list[dict[str, Any]]:
+        if self.anchor_path is None or not self.anchor_path.exists():
+            return []
+        return [json.loads(line) for line in self.anchor_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
 
     def reconstruct(self, trace_id: str) -> dict[str, Any]:
         """Everything needed to replay one interaction (assessment 2.7)."""
@@ -118,6 +170,14 @@ class AuditLog:
             "delegations": [e["payload"] for e in by("delegation")],
             "tools_requested": [e["payload"] for e in by("action_prepared")],
             "human_decisions": [e["payload"] for e in by("action_approved") + by("action_denied")],
+            "denials": [e["payload"] for e in by("action_denied")],
+            # Every refused attempt, not only the happy path: who tried what and
+            # why the gateway said no.
+            "authorization_violations": [
+                {"event": e["event"], "actor": e["actor"], **e["payload"]}
+                for e in events if e["event"] in {
+                    "authorization_violation", "action_refused", "action_execution_blocked",
+                    "action_integrity_violation"}],
             "resulting_actions": [e["payload"] for e in by("action_executed")],
             "outputs": [e["payload"] for e in by("response")],
             "timeline": events,

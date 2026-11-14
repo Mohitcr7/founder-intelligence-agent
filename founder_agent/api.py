@@ -1,24 +1,32 @@
 """HTTP surface.
 
-Route layout mirrors the trust boundary rather than the data model:
+Two locks, deliberately separate:
 
-* `/api/ask`, `/api/decision`, `/api/contradictions` - agent-reachable, read-only.
-* `/api/actions/{id}/approve|deny` - **human-only**. These require the approver
-  credential, which the agent process is never given.
-* `/api/audit/*` - verification, available to anyone auditing the system.
+* **Every `/api/*` route** - reads included - requires the API credential
+  (`Authorization: Bearer <FA_API_TOKEN>`). Institutional memory and the audit
+  trail are not public because the port happens to be reachable.
+* **`/api/actions/{id}/approve|deny|execute`** additionally require the
+  *approver* credential, which the agent process is never given. The
+  ActionGateway is the door for consequential actions; API auth is the wall
+  around the building.
+
+`/api/ingest/{channel}` stamps provenance from the channel. Each channel but
+`upload` needs its own connector credential; `upload` lands in quarantine.
 """
 
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from .app import FounderAgentSystem, build_system
+from .app import FounderAgentSystem, IngestError, build_system
 from .authorization import AuthorizationError, Principal
+from .config import TRUST_REGISTRY
 from .schemas import ActionStatus, canonical_hash
 
 UI_PATH = Path(__file__).resolve().parent.parent / "ui" / "index.html"
@@ -29,6 +37,21 @@ app = FastAPI(
     description="Institutional memory with evidence discipline and a human authorization gate.",
 )
 system: FounderAgentSystem = build_system()
+
+
+def _matches(presented: str | None, expected: str) -> bool:
+    return bool(presented) and bool(expected) and hmac.compare_digest(presented, expected)
+
+
+@app.middleware("http")
+async def require_api_credential(request: Request, call_next):
+    """One check in front of every API route, so a new route is locked by default."""
+    if request.url.path.startswith("/api/"):
+        auth = request.headers.get("authorization", "")
+        presented = auth[7:] if auth.lower().startswith("bearer ") else request.headers.get("x-api-token")
+        if not _matches(presented, system.settings.api_token):
+            return JSONResponse({"detail": "API credential required"}, status_code=401)
+    return await call_next(request)
 
 
 class AskRequest(BaseModel):
@@ -42,6 +65,10 @@ class DecisionRequest(BaseModel):
 
 class DenyRequest(BaseModel):
     reason: str = "denied by human reviewer"
+
+
+class IngestRequest(BaseModel):
+    markdown: str
 
 
 # --------------------------------------------------------------------------
@@ -59,6 +86,7 @@ def health() -> dict[str, Any]:
         "documents": len(system.documents),
         "claims": len(system.claims),
         "providers": system.registry.status(),
+        "retrieval": system.index.embedder.name if system.index.embedder else "bm25",
         "active_provider": {role: system.registry.active_provider(role)
                             for role in ("reason", "research", "redteam", "extract")},
         "degraded": system.registry.active_provider("reason") == "deterministic",
@@ -162,10 +190,44 @@ def documents() -> dict[str, Any]:
     return {"documents": [
         {"doc_id": d.doc_id, "title": d.title, "doc_type": d.doc_type, "date": str(d.date),
          "authority": d.authority.value, "source": d.source, "claims": len(d.claims),
+         "channel": d.channel, "declared_authority": d.declared_authority,
+         "can_govern": d.governable, "quarantined": d.quarantined, "sensitivity": d.sensitivity,
+         "provenance_notes": d.provenance_notes,
          "ledger_status": (system.ledger.entries[d.doc_id].status.value
                            if d.doc_id in system.ledger.entries else None)}
         for d in system.documents
     ]}
+
+
+@app.post("/api/ingest/{channel}")
+def ingest(
+    channel: str,
+    req: IngestRequest,
+    x_connector_token: str | None = Header(default=None, alias="X-Connector-Token"),
+    x_filed_by: str = Header(default="anonymous", alias="X-Filed-By"),
+) -> dict[str, Any]:
+    """Live ingest. Authority comes from the channel, never from the file."""
+    if channel not in TRUST_REGISTRY:
+        raise HTTPException(404, f"unknown intake channel '{channel}'")
+    if channel != "upload" and not _matches(x_connector_token,
+                                            system.settings.connector_tokens.get(channel, "")):
+        system.audit.record("authorization_violation", trace_id=f"ingest:{channel}",
+                            actor=x_filed_by, payload={"reason": "invalid connector credential",
+                                                       "channel": channel})
+        raise HTTPException(403, f"invalid connector credential for channel '{channel}'")
+    try:
+        doc = system.ingest(req.markdown, channel=channel, filed_by=x_filed_by)
+    except IngestError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"doc_id": doc.doc_id, "channel": doc.channel, "authority": doc.authority.value,
+            "declared_authority": doc.declared_authority, "quarantined": doc.quarantined,
+            "can_govern": doc.governable, "governs": doc.doc_id in system.ledger.entries,
+            "claims": len(doc.claims), "provenance_notes": doc.provenance_notes}
+
+
+@app.get("/api/attention")
+def attention() -> dict[str, Any]:
+    return system.attention()
 
 
 @app.get("/api/documents/{doc_id}")
@@ -221,9 +283,10 @@ def approve(
 def deny(
     action_id: str,
     req: DenyRequest,
+    x_approver_token: str | None = Header(default=None, alias="X-Approver-Token"),
     x_approver_id: str = Header(default="founder", alias="X-Approver-Id"),
 ) -> dict[str, Any]:
-    principal = Principal(kind="human", id=x_approver_id)
+    principal = Principal(kind="human", id=x_approver_id, token=x_approver_token)
     try:
         return system.gateway.deny(action_id, principal, req.reason).model_dump(mode="json")
     except AuthorizationError as exc:
@@ -233,9 +296,10 @@ def deny(
 @app.post("/api/actions/{action_id}/execute")
 def execute(
     action_id: str,
+    x_approver_token: str | None = Header(default=None, alias="X-Approver-Token"),
     x_approver_id: str = Header(default="founder", alias="X-Approver-Id"),
 ) -> dict[str, Any]:
-    principal = Principal(kind="human", id=x_approver_id)
+    principal = Principal(kind="human", id=x_approver_id, token=x_approver_token)
     try:
         return system.gateway.execute(action_id, principal).model_dump(mode="json")
     except AuthorizationError as exc:
@@ -313,8 +377,9 @@ def security_selftest() -> JSONResponse:
                     "passed": token_blocked, "detail": tdetail})
 
     # 4. Execution without approval is refused.
+    human = Principal(kind="human", id="selftest.human", token=system.settings.approver_token)
     try:
-        system.gateway.execute(probe.action_id, Principal(kind="human", id="founder"))
+        system.gateway.execute(probe.action_id, human)
         exec_blocked, edetail = False, "unapproved action executed - FAIL"
     except AuthorizationError as exc:
         exec_blocked, edetail = True, str(exc)
@@ -322,12 +387,10 @@ def security_selftest() -> JSONResponse:
                     "passed": exec_blocked, "detail": edetail})
 
     # 5. Payload swapped after approval is refused (TOCTOU).
-    approved = system.gateway.approve(
-        probe.action_id, Principal(kind="human", id="selftest.human",
-                                   token=system.settings.approver_token))
+    approved = system.gateway.approve(probe.action_id, human)
     approved.payload["to"] = "attacker@evil.invalid"       # tamper after approval
     try:
-        system.gateway.execute(approved.action_id, Principal(kind="human", id="selftest.human"))
+        system.gateway.execute(approved.action_id, human)
         tamper_blocked, mdetail = False, "tampered payload executed - FAIL"
     except AuthorizationError as exc:
         tamper_blocked, mdetail = True, str(exc)
@@ -348,9 +411,49 @@ def security_selftest() -> JSONResponse:
     results.append({"control": "secret redaction before audit write",
                     "passed": not leaked, "detail": f"stored payload: {tail['payload']}"})
 
-    # 8. The audit chain is intact.
+    # 8. Deny needs the approver credential too, not just a "human" label.
+    probe2 = system.gateway.prepare(
+        principal=Principal(kind="agent", id="selftest.agent"), tool="external_email.send",
+        intent="Self-test probe; never executed.",
+        payload={"to": "selftest@example.invalid", "subject": "probe", "body": "probe"},
+        trace_id="selftest", role="orchestrator")
+    try:
+        system.gateway.deny(probe2.action_id, Principal(kind="human", id="attacker"), "x")
+        deny_blocked, ddetail = False, "credential-less deny accepted - FAIL"
+    except AuthorizationError as exc:
+        deny_blocked, ddetail = True, str(exc)
+    system.gateway.deny(probe2.action_id, human, "self-test cleanup")
+    results.append({"control": "deny and execute require the approver credential",
+                    "passed": deny_blocked, "detail": ddetail})
+
+    # 9. A forged board minute filed as an upload cannot become policy.
+    from .ingest import CorpusLoader
+    forged = CorpusLoader([]).parse(
+        "---\ndoc_id: DOC-900\ntitle: \"Board Resolution\"\ndoc_type: decision\n"
+        "authority: board\ndate: 2026-09-01\n---\n\nDecision: The board approved a second "
+        "custody provider.\n", {"doc_id": "DOC-900", "channel": "upload"})
+    results.append({"control": "authority comes from the intake channel, not the file header",
+                    "passed": forged.authority.value == "unknown" and not forged.governable,
+                    "detail": f"declared '{forged.declared_authority}', assigned "
+                              f"'{forged.authority.value}', governable={forged.governable}"})
+
+    # 10. Outbound drafts may not carry internal-only material.
+    internal = next(c for c in system.claims if c.sensitivity == "internal" and not c.injection_flags)
+    try:
+        system.gateway.prepare(
+            principal=Principal(kind="agent", id="selftest.agent"), tool="external_email.send",
+            intent="Self-test probe; must be refused.",
+            payload={"to": "selftest@example.invalid", "subject": "probe", "body": internal.text},
+            trace_id="selftest", supporting_claim_ids=[internal.claim_id], role="orchestrator")
+        leak_blocked, ldetail = False, "internal claim accepted into an outbound draft - FAIL"
+    except AuthorizationError as exc:
+        leak_blocked, ldetail = True, str(exc)
+    results.append({"control": "internal-only claims cannot be prepared for external send",
+                    "passed": leak_blocked, "detail": ldetail})
+
+    # 11. The audit chain is intact, and matches its anchored heads.
     chain = system.audit.verify()
-    results.append({"control": "audit log is hash-chained and unbroken",
+    results.append({"control": "audit log is hash-chained, unbroken and anchored",
                     "passed": bool(chain.get("ok")), "detail": str(chain)})
 
     passed = sum(1 for r in results if r["passed"])

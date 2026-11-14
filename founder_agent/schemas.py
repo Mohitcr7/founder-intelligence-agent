@@ -47,6 +47,8 @@ class Authority(str, Enum):
     FINANCE = "finance"
     COMPLIANCE = "compliance"
     EXTERNAL = "external"
+    #: Arrived through a channel that vouches for no one (manual upload).
+    UNKNOWN = "unknown"
 
 
 #: Who outranks whom when two records conflict and both are current.
@@ -57,7 +59,11 @@ AUTHORITY_RANK: dict[str, int] = {
     Authority.FINANCE: 50,
     Authority.ENGINEERING: 40,
     Authority.EXTERNAL: 10,
+    Authority.UNKNOWN: 0,
 }
+
+#: Release classes. Only these may leave the company in an outbound draft.
+SHAREABLE = {"public", "customer_shareable"}
 
 
 # --------------------------------------------------------------------------
@@ -78,8 +84,10 @@ class Claim(BaseModel):
     authority: Authority = Authority.ENGINEERING
     doc_title: str = ""
     doc_source: str = ""
-    #: Set when ingestion detects instruction-shaped text inside a document.
+    #: Why this claim is quarantined: instruction-shaped text, a tainted source
+    #: document, or unverified provenance. Non-empty means data only.
     injection_flags: list[str] = Field(default_factory=list)
+    sensitivity: str = "internal"
 
 
 class Document(BaseModel):
@@ -95,6 +103,22 @@ class Document(BaseModel):
     superseded_by: str | None = None
     body: str
     claims: list[Claim] = Field(default_factory=list)
+
+    # Provenance: stamped from the intake channel, not read from the file.
+    channel: str = "upload"
+    filed_by: str = ""
+    received_at: datetime | None = None
+    #: The `authority:` the file claims for itself. Shown, never ranked on.
+    declared_authority: str | None = None
+    can_govern: bool = False
+    quarantined: bool = True
+    sensitivity: str = "internal"
+    provenance_notes: list[str] = Field(default_factory=list)
+
+    @property
+    def governable(self) -> bool:
+        """May this document set or change policy? Channel-granted and untainted."""
+        return self.can_govern and not any(c.injection_flags for c in self.claims)
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +200,8 @@ class GoverningDecision(BaseModel):
     #: Other records that pull against this one while it is still in force.
     contested_by: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    #: Sentences admitting a change happened without a decision record.
+    gap_claim_ids: list[str] = Field(default_factory=list)
 
 
 class DecisionLookup(BaseModel):
@@ -208,6 +234,9 @@ class Contradiction(BaseModel):
     why: str
     resolution: str
     detector: str
+    #: Which thing on the axis this is about, so two issues sharing an axis
+    #: (signing-log retention vs customer-data retention) do not merge.
+    subject: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +264,8 @@ class DelegationResult(BaseModel):
     tokens_used: int = 0
     #: Anything the subordinate agent refused to do, and why.
     refusals: list[str] = Field(default_factory=list)
+    #: Claims the agent obtained through its own audited, in-scope tool calls.
+    tool_claim_ids: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +274,9 @@ class DelegationResult(BaseModel):
 class ActionStatus(str, Enum):
     PENDING = "PENDING_HUMAN_AUTHORIZATION"
     APPROVED = "APPROVED"
+    #: Intent to send is on disk; the transport has not confirmed. A process
+    #: that dies here must not send again on restart.
+    EXECUTING = "EXECUTING"
     DENIED = "DENIED"
     EXECUTED = "EXECUTED"
     EXPIRED = "EXPIRED"
@@ -287,6 +321,7 @@ class ContradictionCluster(BaseModel):
 
     cluster_id: str
     axis: str
+    subject: str = ""
     title: str
     severity: Literal["low", "medium", "high"]
     documents: list[str]

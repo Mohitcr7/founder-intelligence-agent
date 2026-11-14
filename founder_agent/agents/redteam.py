@@ -25,8 +25,8 @@ class RedTeamAgent(SubAgent):
     description = "Attacks the proposal: standing decisions it violates, weak evidence, missing conditions."
     granted_tools = frozenset({"corpus.search"})
 
-    def __init__(self, registry, audit, ledger: DecisionLedger) -> None:
-        super().__init__(registry, audit, ledger)
+    def __init__(self, registry, audit, ledger: DecisionLedger, tools=None) -> None:
+        super().__init__(registry, audit, ledger, tools)
 
     def analyse(self, request: DelegationRequest, claims: list[Claim]) -> DelegationResult:
         findings: list[str] = []

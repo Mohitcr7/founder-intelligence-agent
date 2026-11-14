@@ -116,18 +116,27 @@ class AnthropicProvider:
 
 
 class OpenAIProvider:
+    """OpenAI Chat Completions - and, with `base_url`, any server that speaks
+    the same protocol (Ollama, llama.cpp, vLLM), which is how an air-gapped
+    deployment runs a local model without adding an SDK."""
+
     name = "openai"
 
-    def __init__(self, model: str = "gpt-4.1") -> None:
+    def __init__(self, model: str = "gpt-4.1", *, base_url: str = "https://api.openai.com/v1",
+                 key_env: str = "OPENAI_API_KEY", name: str = "openai") -> None:
         self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.key_env = key_env
+        self.name = name
 
     def available(self) -> bool:
-        return bool(os.environ.get("OPENAI_API_KEY"))
+        # A local server needs no key; a hosted one does.
+        return bool(os.environ.get(self.key_env)) if self.key_env else bool(self.base_url)
 
     def complete(self, request: LLMRequest) -> LLMResponse:
-        key = os.environ.get("OPENAI_API_KEY")
-        if not key:
-            return LLMResponse("", self.name, self.model, error="missing OPENAI_API_KEY")
+        key = os.environ.get(self.key_env, "") if self.key_env else ""
+        if self.key_env and not key:
+            return LLMResponse("", self.name, self.model, error=f"missing {self.key_env}")
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_tokens,
@@ -138,8 +147,9 @@ class OpenAIProvider:
             body["response_format"] = {"type": "json_object"}
         try:
             r = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "content-type": "application/json"},
+                f"{self.base_url}/chat/completions",
+                headers={"content-type": "application/json",
+                         **({"Authorization": f"Bearer {key}"} if key else {})},
                 json=body,
                 timeout=_TIMEOUT,
             )

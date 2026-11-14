@@ -6,9 +6,17 @@ the same subject in the same period. So the system extracts a small typed
 stance from each claim and compares stances, which is why it can say why a
 conflict exists rather than that two documents "mention the same words".
 
-Axes are declarative configuration. Adding an axis is a data change, and a
-model can propose candidate axes for a human to accept - but the comparison
-itself stays deterministic so the same corpus always yields the same findings.
+Axes are declarative configuration, and they are an ops-owned catalogue: a
+knowledge/compliance owner accepts new axes through review, the way any schema
+change lands. Founders resolve conflicts *on* an axis; they are not asked to
+define axes. A model may propose candidates into that review queue, but it is
+never the runtime judge of "these two conflict" - findings that flicker
+between runs are worse than none.
+
+Each axis also names its subjects. Two statements conflict only when they take
+different positions on the same axis *about the same thing*: a 7-year rule for
+signing logs and a 30-day rule for support tickets are both retention periods,
+and not a contradiction.
 """
 
 from __future__ import annotations
@@ -37,11 +45,25 @@ class StanceAxis:
     positions: tuple[Position, ...]
     #: Why the positions cannot coexist - the semantic core of the explanation.
     incompatibility: str
+    #: What a claim on this axis is about unless it names something else.
+    default_subject: str = ""
+    #: Other things the same axis can be about, recognised by pattern.
+    subjects: tuple[tuple[str, re.Pattern[str]], ...] = ()
     field_: str = field(default="", repr=False)
+
+    def subject_of(self, text: str) -> str:
+        for key, pattern in self.subjects:
+            if pattern.search(text):
+                return key
+        return self.default_subject
 
 
 def _p(name: str, pattern: str, gloss: str) -> Position:
     return Position(name, re.compile(pattern, re.IGNORECASE), gloss)
+
+
+def _s(key: str, pattern: str) -> tuple[str, re.Pattern[str]]:
+    return key, re.compile(pattern, re.IGNORECASE)
 
 
 # A claim that proposes, evaluates or questions something takes no position on
@@ -86,6 +108,8 @@ AXES: tuple[StanceAxis, ...] = (
             "statements are not different words for one arrangement - they describe "
             "arrangements that cannot both hold."
         ),
+        default_subject="production_keys",
+        subjects=(_s("test_keys", r"\b(sandbox|test|staging)\b[^.]{0,25}\bkeys?\b"),),
     ),
     StanceAxis(
         name="log_retention_period",
@@ -99,6 +123,9 @@ AXES: tuple[StanceAxis, ...] = (
             "kept for one duration, not two. Two different durations asserted as the policy "
             "cannot both be in force."
         ),
+        default_subject="signing_logs",
+        subjects=(_s("customer_data", r"\bcustomer (data|records)\b|\bpersonal data\b"),
+                  _s("support_records", r"\bsupport tickets?\b")),
     ),
     StanceAxis(
         name="eu_region_decision",
@@ -113,6 +140,7 @@ AXES: tuple[StanceAxis, ...] = (
             "A plan is either adopted or still open. Treating an unadopted recommendation "
             "as a decision manufactures institutional authority that nobody granted."
         ),
+        default_subject="frankfurt_region",
     ),
 )
 
@@ -136,6 +164,12 @@ class Stance:
     position: str
     gloss: str
     evidence_span: str
+    subject: str = ""
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Two stances are comparable only when this matches."""
+        return self.axis.name, self.subject
 
 
 def stances_of(claim: Claim, *, assertive_only: bool = True) -> list[Stance]:
@@ -165,7 +199,8 @@ def stances_of(claim: Claim, *, assertive_only: bool = True) -> list[Stance]:
                 label = pos.name
                 if axis.name == "log_retention_period":
                     label = f"{m.group(1)}-year"
-                hits.append((m.start(), Stance(axis, label, pos.gloss, m.group(0))))
+                hits.append((m.start(), Stance(axis, label, pos.gloss, m.group(0),
+                                               axis.subject_of(text))))
         if hits:
             hits.sort(key=lambda h: h[0])
             found.append(hits[0][1])

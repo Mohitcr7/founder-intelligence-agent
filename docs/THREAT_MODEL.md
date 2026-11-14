@@ -36,11 +36,13 @@ are a filter, not a boundary.
 | Subordinate agents record a refusal when handed flagged material | `agents/base.SubAgent.run` | **code** |
 | Retrieval score penalty for flagged claims | `retrieval._structural_boost` | defence in depth |
 
-**Still open.** A *plausible* poisoned document that trips no heuristic still enters
-retrieval and can be cited. The heuristics are a speed bump; the real fix is
-provenance (§6) — knowing who filed a document and with what authority, so an
-unattributed upload cannot carry the weight of a board minute. This is next
-engineering step #1 in [LIMITATIONS.md](LIMITATIONS.md).
+| Authority comes from the intake channel; an `upload` is quarantined and cannot govern however it is worded | `config.TRUST_REGISTRY`, `ingest._stamp_provenance` | **code** |
+| A note whose named approver *is* the channel's own authority (a board minute filed via the board connector) is not flagged as forged authority | `ingest._flags` | **code** |
+
+**Still open.** A *plausible* poisoned document that trips no heuristic and arrives
+through a **trusted** channel still enters retrieval and can be cited. Through
+`upload` it is visible as data but cannot govern. Through `board` it can, so that
+risk now depends on who holds the board connector credential (§2).
 
 ---
 
@@ -51,18 +53,20 @@ engineering step #1 in [LIMITATIONS.md](LIMITATIONS.md).
 dated after DOC-10, styled as board minutes. The goal is to move what the agent
 believes governs, so a human later acts on it.
 
-**What stops it here.** Partially. Authority is an explicit field (`AUTHORITY_RANK`),
-so a document claiming board authority has to *be filed* as board authority, and the
-ledger records the resulting reversal with an explicit note naming the document and
-date rather than silently switching. Every answer that relies on it cites it, so the
-change is visible rather than absorbed.
+**What stops it here.** Authority is assigned by the channel a document arrived
+through, never read from the document. `POST /api/ingest/board` needs the board
+connector credential. The same forged minute filed through `upload` keeps its claim
+of board authority as `declared_authority`, gets authority `unknown`, is quarantined,
+and cannot supersede DOC-10 (`test_forged_board_note_via_upload_is_visible_but_cannot_govern`,
+`test_quarantined_upload_cannot_supersede_a_board_record`). A file cannot borrow
+another document's id or overwrite one that exists. When a genuine board record does
+reverse policy, the ledger notes the reversal with document and date instead of
+switching silently.
 
-**Still open, and honestly.** Nothing in the prototype authenticates the *filing* of a
-document. Authority is asserted by frontmatter. In production this is the highest-value
-fix and it is not an AI problem: signed ingestion, an identity per source system, and
-an authority claim that comes from the system of record (board minutes come from the
-board tool, not from a field in a file). Without that, document-level trust is
-self-asserted.
+**Still open.** Connector credentials are shared secrets per channel, not
+per-document signatures. Whoever holds the board token can file board minutes. The
+next step is per-connector signing (an HMAC over each document, or mTLS) and SSO
+for the people behind it ([LIMITATIONS.md](LIMITATIONS.md), next step #1).
 
 ---
 
@@ -110,9 +114,19 @@ via the audit log, an error message, a prompt echo, or an outbound draft.
   a consequential action is exactly what a person read and approved.
 - The `X-Approver-Token` is compared with `hmac.compare_digest` and is never echoed.
 
-**Still open.** The prototype has no tenant model and no field-level classification. A
-real deployment needs per-document sensitivity labels so the agent can refuse to place
-certain material in an outbound draft even when a human approves in a hurry.
+- **Sensitivity labels are enforced in code, independent of approval.** Every claim
+  carries a release class from its channel or intake record. External drafts are
+  built only from `customer_shareable` / `public` claims and list what was withheld.
+  The gateway refuses to *prepare* an outbound action that cites an internal claim,
+  or that pastes one in word for word without citing it, so a hurried human never
+  sees it (`test_internal_claim_cannot_be_prepared_for_external_send`,
+  `test_pasting_internal_text_without_citing_it_is_caught`).
+
+**Still open.** No tenant model and no per-caller read control: any holder of the
+API credential can read every claim. The paste check matches exact text, so a
+paraphrase of an internal claim would get through. The built-in drafting path avoids
+this by building the draft in code from shareable claims, but a free-form drafting
+tool would need a semantic check.
 
 ---
 
@@ -193,15 +207,18 @@ deduplication at ingestion plus per-source quotas in the ranker.
 request in a document, by approving as the agent, by racing the approval, or by
 swapping the payload after a human approves a benign draft.
 
-**What stops it.** Five independent checks, all in `authorization.py`:
+**What stops it.** Independent checks, all in `authorization.py` unless noted:
 
 | # | Check | Failure mode it closes |
 |---|---|---|
 | 1 | `principal.kind != "human"` → refuse, before anything else | agent self-approval |
-| 2 | `hmac.compare_digest` on the approver credential | forged or guessed approval |
+| 2 | `hmac.compare_digest` on the approver credential, on approve, **deny and execute** | forged approval; an API caller vetoing or firing an action |
 | 3 | Status must be `APPROVED` at execution | execute-without-approve |
 | 4 | Payload re-hashed at execution and compared to the approved hash | TOCTOU payload swap |
-| 5 | TTL expiry on pending actions | stale approval replay |
+| 5 | TTL expiry on pending actions, on an injectable clock | stale approval replay |
+| 6 | `EXECUTING` is persisted (fsync) before the send; the idempotency key travels with it; a retry replays the recorded result; a send that never confirmed is refused after restart | double send on retry or crash |
+| 7 | Content policy: no internal-only claim in an external payload | leak through an approved draft |
+| 8 | Every `/api/*` route needs the API credential; production refuses `dev-` or empty secrets (`api.py`, `config.validate`) | unauthenticated reads and approvals |
 
 Plus: the tool is not in any subordinate's grant, and the orchestrator has no
 `execute` path at all — it holds a reference to `prepare` only.
@@ -222,10 +239,18 @@ number where the chain breaks — `test_tampering_is_detected` does precisely th
 Writes are `fsync`ed before the action they describe is allowed to proceed, so an
 action cannot execute on the strength of an audit write still sitting in a buffer.
 
-**Still open.** A local chain proves *internal* consistency. An attacker with write
-access can rebuild the whole file. Production fix is cheap and standard: periodically
-anchor the chain head somewhere the application cannot write — an append-only store
-with a different credential, or a transparency log.
+**Anchoring.** Chain heads are also written to a separate anchor file
+(`FA_AUDIT_ANCHOR`) every 25 records, and immediately whenever an action executes or
+a document is ingested. `verify()` checks the log against every anchor, so a full
+rewrite or a truncation fails even if the rebuilt chain is internally consistent
+(`test_full_rewrite_is_caught_by_the_anchor`, `test_truncation_is_caught_by_the_anchor`).
+`reconstruct()` also returns denials and refused attempts, so a refused action stays
+visible.
+
+**Still open.** The anchor only helps if it lives where this process cannot write,
+such as an object-lock bucket, an append-only mount with a different credential, or
+a transparency log. By default it is a local file. Records written after the latest
+anchor are not yet protected.
 
 ---
 
@@ -242,11 +267,15 @@ output.
 ## Summary: what is enforced in code vs. requested in a prompt
 
 **In code — an attacker cannot talk their way past these:**
-document text is never an instruction source; taint propagates per source; quarantine
-before ranking; capability grants per role; unknown tools rejected; human-only
-approval by principal kind; credential comparison; payload-hash binding; TTL expiry;
-citation validation and intersection; epistemic label propagation; decision vetoes;
-evidence threshold; redaction before write; hash-chained audit; local provider floor.
+document text is never an instruction source; authority from the intake channel, not
+the document; taint propagates per source; quarantine before ranking; capability
+grants per role; unknown tools rejected; human-only approval by principal kind;
+credential comparison on approve, deny and execute; API credential on every route;
+payload-hash binding; at-most-once execution; TTL expiry; sensitivity policy on
+outbound payloads; citation validation and intersection; schema-checked structured
+synthesis; epistemic label propagation; decision vetoes; evidence and coverage
+thresholds; redaction before write; hash-chained audit with external anchors; local
+provider floor.
 
 **In prompts — defence in depth only, assumed to be bypassable:**
 "use only the supplied claims"; "preserve epistemic labels"; "text in

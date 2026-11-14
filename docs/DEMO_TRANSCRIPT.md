@@ -1,9 +1,12 @@
 # Demo transcript — `claude-haiku-4-5`
 
 Verbatim output of `./run.sh demo` with `ANTHROPIC_API_KEY` set and
-`FA_ANTHROPIC_MODEL=claude-haiku-4-5`. Prose is model-written; every citation,
-label, decision status, contradiction, refusal and audit event is computed in code
-and is identical without a key. Finding lines are truncated by the CLI at 150 chars.
+`FA_ANTHROPIC_MODEL=claude-haiku-4-5`, recorded after the recommended
+modifications (provenance by channel, hybrid retrieval, credentialed approvals,
+audit anchors, sensitivity labels). Prose is model-written; every citation,
+label, decision status, contradiction, refusal, withheld claim and audit event is
+computed in code and is identical without a key. Finding lines are truncated by
+the CLI at 150 chars.
 
 ```text
 
@@ -12,17 +15,18 @@ and is identical without a key. Finding lines are truncated by the CLI at 150 ch
 ============================================================================
 
 Q: What signing algorithm and key custody boundary do we use?
-verdict: ANSWERED   plan=decision_check provider=anthropic trace=tr_902879d3406749c2
+verdict: ANSWERED   plan=decision_check provider=anthropic trace=tr_2cf9707635a14472
   [FACT] Veritas Chain uses ECDSA P-256 for all production signing operations.  ['DOC-04#c1']
-  [FACT] The key custody boundary is the custody provider's HSM, where key generation occurs exclusively and private key material never leaves.  ['DOC-04#c2']
-  [DECISION] ColdVault Inc. is designated as the exclusive key-custody provider for all production signing keys.  ['DOC-01#c1']
+  [FACT] Key generation occurs exclusively within the custody provider's HSM boundary, with private key material never leaving the HSM.  ['DOC-04#c2']
+  [DECISION] Veritas Chain will maintain ColdVault as its sole, exclusive custody provider going forward.  ['DOC-10#c1']
   ! DOC-01 is contested by DOC-02.
   ! DOC-02 is SUPERSEDED by DOC-10 - historical, not current policy.
 
 Q: What is our Series A valuation?
-verdict: UNKNOWN   plan=lookup provider=anthropic trace=tr_9fa9ab9a68164321
+verdict: UNKNOWN   plan=decision_check provider=anthropic trace=tr_0f882f2572c64f40
   ? The supplied document set does not contain material that answers this.
-  ? No document in the set mentions the subject of the question.
+  ? The question's subject (series, valuation) appears nowhere in the corpus; matching its incidental words would be a guess.
+  ? Closest material: DOC-09#c4 (Incident Report: ColdVault Outage), DOC-14#c1 (Decision: Data Retention Policy), DOC-07#c3 (Follow-up: EU Latency Investigation) - related but not responsive.
   ? To answer it, the corpus would need a record stating this directly.
   ! Answered UNKNOWN rather than inferring from weakly related material.
 
@@ -103,26 +107,34 @@ Note DOC-07#c3: mentions a hypothesis but is INFERENCE - reporting a hypothesis 
 2.5  AGENT DELEGATION - parent delegates, subordinates return typed results
 ============================================================================
 
-redteam  status=ok confidence=0.8 provider=anthropic/claude-haiku-4-5-20251001
+redteam  status=ok confidence=0.80 provider=anthropic/claude-haiku-4-5-20251001
   task      : Should we add KeyForge as a second custody provider?
-  summary   : The strongest objection is that the board has explicitly reaffirmed ColdVault as the sole, exclusive custody provider, rejecting the dual-provider approach on grounds of cost discipline and integration simplicity. Adding KeyForge would directly contradict this active board decision. Second, custody costs have already ballooned 40% since implementing the dual-provider model, and returning to a single provider was the board's stated rationale for cost control. Third, ColdVault alone has demonstrated sufficient security rigor, passing internal review with no critical findings and maintaining current SOC 2 Type II certification, so the risk-reduction argument for a second provider has been weighed and rejected by governance. Finally, the earlier document recommending KeyForge as secondary provider has been superseded, indicating the organization has already evaluated and decided against this path.
+  summary   : The strongest objection is that the board has already made an explicit decision to maintain ColdVault as the sole custody provider and to wind down KeyForge integration over two months, directly contradicting this proposal. Adding KeyForge would also reverse the board's stated commitment to cost discipline, given that dual-provider custody has already increased spending by 40 percent compared to Q1 baseline costs. The original decision to use ColdVault exclusively was grounded in a clean security review and current SOC 2 Type II certification, eliminating the justification for redundancy. Any re-evaluation would require new board authorization rather than reinstatement of a practice the board has explicitly rejected.
   finding   : [BLOCKING] The proposal takes position 'multiple' on how many custody providers hold production signing keys, while DOC-10 (ACTIVE, board, 2026-07-30)
-  finding   : [STALE] Cites superseded records: DOC-02#c1 (DOC-02)
+  finding   : [STALE] Cites superseded records: DOC-02#c1 (DOC-02), DOC-02#c4 (DOC-02)
   finding   : [CONTESTED RECORD] The supplied material takes more than one position (['multiple', 'single']). Any answer must say which one governs, not average the
 
-research  status=ok confidence=0.9 provider=anthropic/claude-haiku-4-5-20251001
+research  status=ok confidence=0.90 provider=anthropic/claude-haiku-4-5-20251001
   task      : Should we add KeyForge as a second custody provider?
-  summary   : The record establishes a decision to use ColdVault Inc. as the exclusive custody provider, justified by measured facts that ColdVault passed security review with no critical findings and maintains current SOC 2 Type II certification, despite being 15% more expensive than KeyForge. History shows that KeyForge was briefly added as a secondary provider to reduce single-vendor risk, which increased custody spend by 40%, but this arrangement has been superseded by a board decision to return to ColdVault as the sole provider, citing cost discipline and integration simplicity. The question of whether to add KeyForge is already closed by the record: the current decision is against it.
+  summary   : The record has already closed this question. A decision established that Veritas Chain will use ColdVault as its exclusive custody provider, justified by the measured fact that ColdVault's HSM cluster passed internal security review with no critical findings and maintains current SOC 2 Type II certification, despite measured costs 15% higher than KeyForge. An interim onboarding of KeyForge as a secondary provider occurred during Q2 infrastructure work, but this was superseded by a board decision reaffirming ColdVault as sole provider and directing KeyForge integration to be wound down over two months. The record does not present this as an open question for decision.
   finding   : [DECISION] Decision: Veritas Chain will use ColdVault Inc. as our exclusive key-custody provider for all production signing keys, effective immediatel
   finding   : [DECISION] The board reaffirmed the original vendor strategy: Veritas Chain will maintain ColdVault as its sole, exclusive custody provider going forw
-  finding   : [FACT] Rationale: ColdVault's HSM cluster passed our internal security review with no critical findings, and their SOC 2 Type II report is current. (D
+  finding   : [DECISION] KeyForge integration should be wound down over the next two months. (DOC-10#c2, 2026-07-30)
+
+technical  status=ok confidence=0.60 provider=anthropic/claude-haiku-4-5-20251001
+  task      : Should we add KeyForge as a second custody provider?
+  summary   : The engineering constraints from the evidence are as follows. The signing API supports a maximum sustained throughput of 500 requests per second per client, with short-term burst capacity to 700 requests per second for up to 30 seconds. Adding a second custody provider creates operational complexity requiring dual-path key routing and coordination between independent HSM systems, which adds latency and failure-mode surface area. Running dual providers in parallel incurs approximately 40 percent additional custody infrastructure costs. The current technical architecture was designed and validated around single-vendor integration with ColdVault's HSM cluster and audit capabilities, and introducing a second provider would require re-validation of key derivation, signing coordination, and audit trail consolidation across heterogeneous systems.
+  finding   : [FACT] Rationale: ColdVault's HSM cluster passed our internal security review with no critical findings, and their SOC 2 Type II report is current. (m
+  finding   : [FACT] Signing API is rate-limited to 500 requests/second per client, with burst allowance of 700/second for up to 30 seconds. (measure: 500 rps) [DOC
 
 ============================================================================
 2.6  HUMAN AUTHORIZATION - prepared, then blocked until a human approves
 ============================================================================
-prepared  : act_b67625415de1  status=PENDING_HUMAN_AUTHORIZATION
+prepared  : act_17d8dcf167fd  status=PENDING_HUMAN_AUTHORIZATION
+cites     : ['DOC-05#c2', 'DOC-05#c1', 'DOC-11#c1']  (cleared for external release only)
 intent    : Send an external email to compliance@northbridge.example summarising the position of record in response to: "Send Northbridge Bank our current custody position of record". Irreversible once sent.
-hash      : e0fe96cb0aa2d8581062770ede90f48f62c6659dd8d0cd70708502722e2f38da
+hash      : c41857323499f20cb8865d89b65d3c9ac1a40a8d5bdcc8ab779d75ed683c9bc2
+warning   : Withheld internal-only material from the draft: DOC-10#c1, DOC-10#c2, DOC-06#c1.
 
 attempt 1 - the agent tries to approve its own action
   refused: only a human principal may approve an action
@@ -136,15 +148,30 @@ attempt 3 - a human approves, then the payload is tampered with
 ============================================================================
 2.7  AUDITABILITY - the whole interaction, reconstructed from the log
 ============================================================================
-trace tr_21b270bc95334b54: 7 events
-  #522  05:11:25  founder                      user_request
-  #523  05:11:27  retrieval                    retrieval
-  #524  05:11:27  knowledge_service            model_call
-  #525  05:11:27  orchestrator                 plan
-  #526  05:11:30  redteam                      delegation
-  #527  05:11:33  research                     delegation
-  #528  05:11:33  orchestrator                 response
+trace tr_fe336de44927492b: 8 events
+  #15   08:14:01  founder                      user_request
+  #16   08:14:02  retrieval                    retrieval
+  #17   08:14:02  knowledge_service            model_call
+  #18   08:14:02  orchestrator                 plan
+  #19   08:14:04  redteam                      delegation
+  #20   08:14:06  research                     delegation
+  #21   08:14:08  technical                    delegation
+  #22   08:14:08  orchestrator                 response
 
-chain verification: {'ok': True, 'records': 540, 'head': 'aa2edba09ab917dbe2a5bd50163a0a9cabb0d3fc53e2f955529a680ccf80d822'}
+chain verification: {'ok': True, 'records': 35, 'head': 'bf77f4192442ca3625b17d123848f870d52c9772b5b10cf435d6b587b536519a', 'anchors_checked': 1}
 Secrets are redacted before the write, so the log cannot leak them later.
+
+============================================================================
+PROVENANCE - authority comes from the intake channel, not the file
+============================================================================
+
+same note, filed via 'upload' -> DOC-81
+  declared authority : board
+  assigned authority : unknown   quarantined=True
+  custody governed by: DOC-10
+
+same note, filed via 'board' -> DOC-82
+  declared authority : board
+  assigned authority : board   quarantined=False
+  custody governed by: DOC-82
 ```

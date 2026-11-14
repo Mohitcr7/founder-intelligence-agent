@@ -40,9 +40,13 @@ _RATIONALE_CLAUSE = re.compile(
 
 class DecisionLedger:
     def __init__(self, documents: list[Document]) -> None:
-        self.documents = {d.doc_id: d for d in documents}
+        # Only a document from a channel that may govern, and that carries no
+        # quarantined text, can enter the ledger. A forged board minute filed as
+        # an upload is retrievable as data and invisible here.
+        self.documents = {d.doc_id: d for d in documents if d.governable}
         self.entries: dict[str, GoverningDecision] = {}
         self._build()
+        self._links = self._link_graph()
 
     # -- construction ------------------------------------------------------
     def _build(self) -> None:
@@ -71,6 +75,7 @@ class DecisionLedger:
                 claim_ids=[c.claim_id for c in body],
                 supersedes=list(doc.supersedes),
                 superseded_by=doc.superseded_by,
+                gap_claim_ids=[c.claim_id for c in doc.claims if _INFORMAL.search(c.text)],
             )
 
         self._resolve_statuses()
@@ -158,14 +163,14 @@ class DecisionLedger:
     def _shared_axis(self, a: GoverningDecision, b: GoverningDecision):
         sa = self._stances(a)
         sb = self._stances(b)
-        shared = {s.axis.name for s in sa} & {s.axis.name for s in sb}
+        shared = {s.key for s in sa} & {s.key for s in sb}
         if not shared:
             return None, None, None
-        axis = sorted(shared)[0]
+        key = sorted(shared)[0]
         return (
-            axis,
-            next(s.position for s in sa if s.axis.name == axis),
-            next(s.position for s in sb if s.axis.name == axis),
+            key[0],
+            next(s.position for s in sa if s.key == key),
+            next(s.position for s in sb if s.key == key),
         )
 
     def _stances(self, entry: GoverningDecision):
@@ -176,23 +181,42 @@ class DecisionLedger:
     def _chronological(a: GoverningDecision, b: GoverningDecision):
         return (a, b) if (a.date or date.min) <= (b.date or date.min) else (b, a)
 
+    def _link_graph(self) -> dict[str, set[str]]:
+        links: dict[str, set[str]] = {d: set() for d in self.entries}
+        for entry in self.entries.values():
+            related = entry.supersedes + entry.contested_by + (
+                [entry.superseded_by] if entry.superseded_by else [])
+            for other in related:
+                if other in self.entries:
+                    links[entry.doc_id].add(other)
+                    links[other].add(entry.doc_id)      # walk the chain both ways
+        return links
+
+    def lineage(self, doc_ids) -> list[GoverningDecision]:
+        """Every entry connected to these by supersession or contest, transitively.
+
+        Retrieval can surface one link of a chain - only the old founder memo,
+        say. Walking the whole chain is what stops "whatever was retrieved"
+        from becoming "the answer": the board record that reversed it comes
+        along whether or not search found it.
+        """
+        seen: set[str] = set()
+        queue = [d for d in doc_ids if d in self.entries]
+        while queue:
+            current = queue.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            queue.extend(self._links.get(current, ()))
+        return sorted((self.entries[d] for d in seen),
+                      key=lambda e: (e.date or date.min), reverse=True)
+
     # -- query -------------------------------------------------------------
     def lookup(self, question: str, candidate_doc_ids: list[str]) -> DecisionLookup:
         """Find the governing decision behind a question, if one exists."""
-        relevant = [self.entries[d] for d in candidate_doc_ids if d in self.entries]
-        if not relevant:
+        lineage = self.lineage(candidate_doc_ids)
+        if not lineage:
             return DecisionLookup(question=question, found=False)
-
-        # Pull in the rest of the lineage so history is complete even when
-        # retrieval only surfaced one link of the chain.
-        expanded = dict((e.doc_id, e) for e in relevant)
-        for entry in list(expanded.values()):
-            for related in entry.supersedes + entry.contested_by + (
-                    [entry.superseded_by] if entry.superseded_by else []):
-                if related in self.entries:
-                    expanded.setdefault(related, self.entries[related])
-
-        lineage = sorted(expanded.values(), key=lambda e: (e.date or date.min), reverse=True)
         governing = self._pick_governing(lineage)
         history = [e for e in lineage if governing is None or e.doc_id != governing.doc_id]
 
@@ -244,7 +268,7 @@ class DecisionLedger:
         gov_stances = self._stances(governing)
         for ps in proposal_stances:
             for gs in gov_stances:
-                if ps.axis.name != gs.axis.name or ps.position == gs.position:
+                if ps.key != gs.key or ps.position == gs.position:
                     continue
                 return ConflictAssessment(
                     conflicts=True,

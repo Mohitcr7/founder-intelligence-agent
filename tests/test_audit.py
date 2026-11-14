@@ -25,7 +25,8 @@ def test_action_lifecycle_is_in_the_log(system):
     system.gateway.approve(action.action_id,
                            Principal(kind="human", id="founder",
                                      token=system.settings.approver_token))
-    system.gateway.execute(action.action_id, Principal(kind="human", id="founder"))
+    system.gateway.execute(action.action_id, Principal(kind="human", id="founder",
+                                                       token=system.settings.approver_token))
     events = [e["event"] for e in system.audit.entries(response.trace_id)]
     assert "action_prepared" in events
     assert "action_approved" in events
@@ -50,7 +51,8 @@ def test_reconstruct_covers_every_field_the_spec_asks_for(system):
     system.gateway.approve(action.action_id,
                            Principal(kind="human", id="founder",
                                      token=system.settings.approver_token))
-    system.gateway.execute(action.action_id, Principal(kind="human", id="founder"))
+    system.gateway.execute(action.action_id, Principal(kind="human", id="founder",
+                                                       token=system.settings.approver_token))
 
     record = system.audit.reconstruct(response.trace_id)
     assert record["user_request"]          # user request
@@ -99,3 +101,67 @@ def test_tampering_is_detected(tmp_path):
     result = log.verify()
     assert result["ok"] is False
     assert result["broken_at"] == 2
+
+
+def _rechain(lines, mutate):
+    """Rewrite every record consistently - the attack a bare hash chain misses."""
+    out, prev = [], "0" * 64
+    for line in lines:
+        rec = json.loads(line)
+        mutate(rec)
+        rec["prev_hash"] = prev
+        rec["hash"] = AuditLog._hash(rec)
+        prev = rec["hash"]
+        out.append(json.dumps(rec, sort_keys=True))
+    return out
+
+
+def test_full_rewrite_is_caught_by_the_anchor(tmp_path):
+    log = AuditLog(tmp_path / "a.jsonl", tmp_path / "anchor.jsonl", anchor_every=2)
+    for i in range(6):
+        log.record("event", trace_id="t", actor="x", payload={"i": i})
+    assert log.verify()["ok"] and log.verify()["anchors_checked"] == 3
+
+    lines = log.path.read_text().splitlines()
+    forged = _rechain(lines, lambda r: r["payload"].update(i=999) if r["seq"] == 2 else None)
+    log.path.write_text("\n".join(forged) + "\n")
+
+    # Without anchors the forgery verifies clean; with them it does not.
+    assert AuditLog(log.path).verify()["ok"] is True
+    result = log.verify()
+    assert result["ok"] is False and "rewritten" in result["reason"]
+
+
+def test_truncation_is_caught_by_the_anchor(tmp_path):
+    log = AuditLog(tmp_path / "a.jsonl", tmp_path / "anchor.jsonl", anchor_every=2)
+    for i in range(6):
+        log.record("event", trace_id="t", actor="x", payload={"i": i})
+    lines = log.path.read_text().splitlines()
+    log.path.write_text("\n".join(lines[:3]) + "\n")
+    result = log.verify()
+    assert result["ok"] is False and "missing" in result["reason"]
+
+
+def test_consequential_events_are_anchored_immediately(tmp_path):
+    log = AuditLog(tmp_path / "a.jsonl", tmp_path / "anchor.jsonl", anchor_every=1000)
+    log.record("action_executed", trace_id="t", actor="x", payload={})
+    assert log.verify()["anchors_checked"] == 1
+
+
+def test_reconstruct_covers_denials_and_violations(system):
+    from founder_agent.authorization import AuthorizationError, Principal
+    response = system.orchestrator.ask("Send Northbridge Bank the position of record",
+                                       prepare_action=True)
+    action = response.pending_action
+    for attempt in (Principal(kind="agent", id="orchestrator", token="x"),
+                    Principal(kind="human", id="attacker", token="guess")):
+        try:
+            system.gateway.approve(action.action_id, attempt)
+        except AuthorizationError:
+            pass
+    system.gateway.deny(action.action_id, Principal(kind="human", id="founder",
+                                                    token=system.settings.approver_token), "no")
+    record = system.audit.reconstruct(response.trace_id)
+    assert record["denials"] and record["denials"][0]["reason"] == "no"
+    actors = {v["actor"] for v in record["authorization_violations"]}
+    assert {"orchestrator", "attacker"} <= actors

@@ -13,9 +13,10 @@ from typing import Any
 from .registry import ToolRegistry, ToolSpec
 
 
-def _send_external_email(payload: dict[str, Any]) -> dict[str, Any]:
+def _send_external_email(payload: dict[str, Any], idempotency_key: str = "") -> dict[str, Any]:
     # Reached only after ActionGateway has verified human approval and that the
-    # payload still hashes to the value the human saw.
+    # payload still hashes to the value the human saw. The idempotency key goes
+    # out as the Message-ID, so a real relay can drop a duplicate send.
     return {
         "simulated": True,
         "transport": "smtp-relay (simulated)",
@@ -23,16 +24,16 @@ def _send_external_email(payload: dict[str, Any]) -> dict[str, Any]:
         "subject": payload.get("subject"),
         "body_chars": len(payload.get("body", "")),
         "sent_at": datetime.now(timezone.utc).isoformat(),
-        "message_id": f"<sim-{abs(hash(str(payload))) % 10**12}@veritaschain.invalid>",
+        "message_id": f"<{idempotency_key or 'sim'}@veritaschain.invalid>",
     }
 
 
-def _draft_document(payload: dict[str, Any]) -> dict[str, Any]:
+def _draft_document(payload: dict[str, Any], idempotency_key: str = "") -> dict[str, Any]:
     return {"simulated": True, "kind": payload.get("kind"), "chars": len(payload.get("body", ""))}
 
 
-def _search_corpus_stub(payload: dict[str, Any]) -> dict[str, Any]:
-    # Real implementation is injected by the orchestrator, which owns the index.
+def _search_corpus_stub(payload: dict[str, Any], idempotency_key: str = "") -> dict[str, Any]:
+    # Replaced at assembly time (app.reindex) by a handler bound to the live index.
     return {"error": "corpus search is bound at runtime"}
 
 

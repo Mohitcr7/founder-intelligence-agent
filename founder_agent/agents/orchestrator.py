@@ -19,6 +19,7 @@ from ..knowledge import KnowledgeService
 from ..llm.registry import ProviderRegistry
 from ..retrieval import ClaimIndex
 from ..schemas import (
+    SHAREABLE,
     ActionRequest,
     Claim,
     ClaimType,
@@ -56,6 +57,7 @@ class Orchestrator:
         registry: ProviderRegistry,
         audit: AuditLog,
         gateway: ActionGateway,
+        tools=None,
     ) -> None:
         self.index = index
         self.ledger = ledger
@@ -66,9 +68,9 @@ class Orchestrator:
         self.gateway = gateway
         self.claims: list[Claim] = index.claims
         self.subagents: dict[str, SubAgent] = {
-            "research": ResearchAgent(registry, audit, ledger),
-            "redteam": RedTeamAgent(registry, audit, ledger),
-            "technical": TechnicalAgent(registry, audit, ledger),
+            "research": ResearchAgent(registry, audit, ledger, tools),
+            "redteam": RedTeamAgent(registry, audit, ledger, tools),
+            "technical": TechnicalAgent(registry, audit, ledger, tools),
         }
         self._clusters = detector.cluster()
 
@@ -199,9 +201,28 @@ class Orchestrator:
     def _prepare_consequential_action(
         self, question: str, answer, trace_id: str, principal: Principal
     ) -> ActionRequest | None:
-        """Compose the outbound message and stop. Execution needs a human."""
+        """Compose the outbound message and stop. Execution needs a human.
+
+        Only claims cleared for external release go into the draft. Internal
+        material (board minutes, cost memos, founder hypotheses) is withheld and
+        listed, because whether it may leave the company is a compliance call,
+        not something an Approve click should settle in passing.
+        """
         governing = self.ledger.lookup(question, [e.doc_id for e in answer.evidence])
-        citations = [e.claim_id for e in answer.evidence[:5]]
+        by_id = {c.claim_id: c for c in self.claims}
+        shareable = [e for e in answer.evidence[:6]
+                     if by_id.get(e.claim_id) and by_id[e.claim_id].sensitivity in SHAREABLE][:4]
+        withheld = [e.claim_id for e in answer.evidence[:6] if e not in shareable]
+        if not shareable:
+            answer.caveats.append(
+                "No action prepared: every claim responsive to this request is internal-only "
+                f"({', '.join(withheld) or 'none retrieved'}). Clearing material for external "
+                "release is a compliance decision.")
+            self.audit.record("action_withheld", trace_id=trace_id, actor="orchestrator",
+                              payload={"reason": "no externally shareable evidence",
+                                       "withheld": withheld})
+            return None
+        citations = [e.claim_id for e in shareable]
 
         body_lines = [
             "Dear Northbridge Bank compliance team,",
@@ -210,16 +231,18 @@ class Orchestrator:
             "Veritas Chain Technologies:",
             "",
         ]
-        body_lines += [f"  - {e.text}  [source: {e.doc_id}]" for e in answer.evidence[:4]]
+        body_lines += [f"  - {e.text}  [source: {e.doc_id}]" for e in shareable]
         body_lines += ["", "Regards,", "Veritas Chain Technologies"]
 
         warnings: list[str] = []
+        if withheld:
+            warnings.append(f"Withheld internal-only material from the draft: {', '.join(withheld)}.")
         if governing.governing and governing.governing.contested_by:
             warnings.append(
                 f"The governing decision {governing.governing.doc_id} is contested by "
                 f"{', '.join(governing.governing.contested_by)}; the statement below may not "
                 f"reflect production reality.")
-        stale = [e.claim_id for e in answer.evidence[:4] if e.caveat]
+        stale = [e.claim_id for e in shareable if e.caveat]
         if stale:
             warnings.append(f"Draft cites material with caveats: {', '.join(stale)}.")
         if answer.verdict != "ANSWERED":

@@ -5,31 +5,66 @@ make it able to.* Approval is a capability held by a human principal, checked
 against a token the agent process is never given, in a code path the agent
 cannot reach.
 
-Three properties the gateway enforces:
+Properties the gateway enforces:
 
-1. **Separation.** `prepare()` is callable by an agent. `approve()` rejects any
-   principal that is not human, before it looks at anything else.
+1. **Separation.** `prepare()` is callable by an agent. `approve()`, `deny()`
+   and `execute()` reject any principal that is not a human holding the
+   approver credential, before they look at anything else.
 2. **Binding.** Approval is bound to a hash of the exact payload the human saw.
    If the payload changes afterwards, execution fails - an agent cannot get a
    benign draft approved and then swap in a different one.
 3. **Expiry.** A pending action goes stale. Stale approval is no approval.
+4. **At most once.** Intent to send is written down before the send. A process
+   that dies mid-send comes back to an EXECUTING action and refuses to send it
+   again until someone reconciles with the transport; a repeated execute of a
+   finished action returns the recorded result instead of sending twice.
+5. **Content.** An outbound draft carrying internal-only material is refused at
+   prepare time, whoever would later click Approve.
 """
 
 from __future__ import annotations
 
 import hmac
-import json
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from .audit import AuditLog
 from .config import Settings, settings as default_settings
-from .schemas import ActionRequest, ActionStatus, canonical_hash, utcnow
+from .schemas import SHAREABLE, ActionRequest, ActionStatus, Claim, canonical_hash, utcnow
 from .tools.registry import ToolRegistry
+
+#: Tools whose payload leaves the company.
+EXTERNAL_TOOLS = {"external_email.send"}
+
+ContentPolicy = Callable[[str, dict[str, Any], list[str]], list[str]]
+
+
+def sensitivity_policy(claims: Callable[[], list[Claim]]) -> ContentPolicy:
+    """Refuse outbound drafts that cite or quote internal-only claims.
+
+    Checked on the claim ids the draft says it rests on *and* on the text
+    itself, so a draft that pastes a board sentence without citing it is
+    caught too. An unknown claim id is treated as internal (fail closed).
+    """
+    def check(tool: str, payload: dict[str, Any], claim_ids: list[str]) -> list[str]:
+        if tool not in EXTERNAL_TOOLS:
+            return []
+        current = claims()
+        by_id = {c.claim_id: c for c in current}
+        # Raw strings, not json.dumps: escaping would hide a pasted quote or em dash.
+        body = " ".join(str(v) for v in payload.values())
+        cited = [cid for cid in claim_ids
+                 if cid not in by_id or by_id[cid].sensitivity not in SHAREABLE]
+        quoted = [c.claim_id for c in current
+                  if c.sensitivity not in SHAREABLE and len(c.text) > 30 and c.text in body]
+        leaked = sorted(set(cited + quoted))
+        return [f"internal-only material in an outbound draft: {', '.join(leaked)}"] if leaked else []
+    return check
 
 
 @dataclass(frozen=True)
@@ -52,11 +87,15 @@ class ActionGateway:
         audit: AuditLog,
         settings: Settings | None = None,
         store_path: Path | None = None,
+        clock: Callable[[], Any] = utcnow,
+        content_policy: ContentPolicy | None = None,
     ) -> None:
         self.registry = registry
         self.audit = audit
         self.settings = settings or default_settings
         self.store_path = store_path or self.settings.actions_path
+        self._now = clock
+        self.content_policy = content_policy
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
         self._actions: dict[str, ActionRequest] = {}
         self._load()
@@ -80,6 +119,13 @@ class ActionGateway:
                               payload={"tool": tool, "reason": reason})
             raise AuthorizationError(reason)
 
+        violations = self.content_policy(tool, payload, supporting_claim_ids or []) \
+            if self.content_policy else []
+        if violations:
+            self.audit.record("action_refused", trace_id=trace_id, actor=principal.id,
+                              payload={"tool": tool, "reason": "; ".join(violations)})
+            raise AuthorizationError("; ".join(violations))
+
         spec = self.registry.get(tool)
         assert spec is not None
         action = ActionRequest(
@@ -91,8 +137,8 @@ class ActionGateway:
             payload=payload,
             payload_hash=canonical_hash(payload),
             status=ActionStatus.PENDING,
-            created_at=utcnow(),
-            expires_at=utcnow() + timedelta(seconds=self.settings.action_ttl_seconds),
+            created_at=self._now(),
+            expires_at=self._now() + timedelta(seconds=self.settings.action_ttl_seconds),
             requested_by=principal.id,
             supporting_claim_ids=supporting_claim_ids or [],
             warnings=warnings or [],
@@ -108,16 +154,18 @@ class ActionGateway:
         return action
 
     # -- step 2: a human decides -------------------------------------------
-    def approve(self, action_id: str, principal: Principal, note: str = "") -> ActionRequest:
+    def _require_human(self, action_id: str, principal: Principal, verb: str) -> None:
         # The boundary check comes first, deliberately: an agent principal is
         # rejected before the gateway even considers the action's contents.
         if principal.kind != "human":
-            self._deny_attempt(action_id, principal, "non-human principal attempted approval")
-            raise AuthorizationError("only a human principal may approve an action")
+            self._deny_attempt(action_id, principal, f"non-human principal attempted to {verb}")
+            raise AuthorizationError(f"only a human principal may {verb} an action")
         if not self._valid_token(principal.token):
-            self._deny_attempt(action_id, principal, "invalid approver credential")
+            self._deny_attempt(action_id, principal, f"invalid approver credential ({verb})")
             raise AuthorizationError("invalid approver credential")
 
+    def approve(self, action_id: str, principal: Principal, note: str = "") -> ActionRequest:
+        self._require_human(action_id, principal, "approve")
         action = self._require(action_id)
         self._expire_if_stale(action)
         if action.status is not ActionStatus.PENDING:
@@ -125,7 +173,7 @@ class ActionGateway:
 
         action.status = ActionStatus.APPROVED
         action.approved_by = principal.id
-        action.approved_at = utcnow()
+        action.approved_at = self._now()
         self._persist(action)
         self.audit.record("action_approved", trace_id=action.trace_id, actor=principal.id, payload={
             "action_id": action_id, "tool": action.tool,
@@ -134,9 +182,10 @@ class ActionGateway:
         return action
 
     def deny(self, action_id: str, principal: Principal, reason: str) -> ActionRequest:
-        if principal.kind != "human":
-            raise AuthorizationError("only a human principal may deny an action")
+        self._require_human(action_id, principal, "deny")
         action = self._require(action_id)
+        if action.status not in {ActionStatus.PENDING, ActionStatus.APPROVED}:
+            raise AuthorizationError(f"action is {action.status.value}; nothing left to deny")
         action.status = ActionStatus.DENIED
         action.denial_reason = reason
         self._persist(action)
@@ -146,9 +195,23 @@ class ActionGateway:
 
     # -- step 3: execution -------------------------------------------------
     def execute(self, action_id: str, principal: Principal) -> ActionRequest:
+        self._require_human(action_id, principal, "execute")
         action = self._require(action_id)
         self._expire_if_stale(action)
 
+        if action.status is ActionStatus.EXECUTED:
+            # A retry after a timeout is not a second send.
+            self.audit.record("action_execute_replayed", trace_id=action.trace_id,
+                              actor=principal.id, payload={"action_id": action_id})
+            return action
+        if action.status is ActionStatus.EXECUTING:
+            self.audit.record("action_execution_blocked", trace_id=action.trace_id,
+                              actor=principal.id, payload={"action_id": action_id,
+                                                           "status": action.status.value})
+            raise AuthorizationError(
+                f"execution of {action_id} started but was never confirmed (process stopped "
+                f"mid-send?). Reconcile with the transport using idempotency key {action_id} "
+                f"before any retry")
         if action.status is not ActionStatus.APPROVED:
             self.audit.record("action_execution_blocked", trace_id=action.trace_id,
                               actor=principal.id,
@@ -169,8 +232,15 @@ class ActionGateway:
         if spec is None:
             raise AuthorizationError(f"tool '{action.tool}' is no longer registered")
 
+        # Intent first, durably: if the process dies inside the handler, the
+        # restarted gateway finds EXECUTING and will not send again.
+        action.status = ActionStatus.EXECUTING
+        self._persist(action)
+        self.audit.record("action_execution_started", trace_id=action.trace_id,
+                          actor=principal.id, payload={"action_id": action_id,
+                                                       "idempotency_key": action_id})
         try:
-            result = spec.handler(action.payload)
+            result = spec.handler(action.payload, idempotency_key=action_id)
             action.status = ActionStatus.EXECUTED
             action.execution_result = result
         except Exception as exc:  # noqa: BLE001
@@ -219,7 +289,7 @@ class ActionGateway:
         return action
 
     def _expire_if_stale(self, action: ActionRequest) -> None:
-        if action.status is ActionStatus.PENDING and utcnow() > action.expires_at:
+        if action.status is ActionStatus.PENDING and self._now() > action.expires_at:
             action.status = ActionStatus.EXPIRED
             self._persist(action)
             self.audit.record("action_expired", trace_id=action.trace_id, actor="system",
@@ -229,6 +299,8 @@ class ActionGateway:
         self._actions[action.action_id] = action
         with self.store_path.open("a", encoding="utf-8") as fh:
             fh.write(action.model_dump_json() + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _load(self) -> None:
         if not self.store_path.exists():

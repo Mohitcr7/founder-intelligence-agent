@@ -151,6 +151,10 @@
   <span class="spacer"></span>
   <span class="stat note">Veritas Chain · assessment corpus</span>
 </header>
+<form id="authbar" class="row" style="display:none;padding:10px 20px;border-bottom:1px solid var(--line)" onsubmit="saveToken(event)">
+  <label for="apitok" class="note">API credential (FA_API_TOKEN · development default <span class="mono">dev-api-token</span>)</label>
+  <input type="password" id="apitok" autocomplete="off" style="min-width:260px"><button class="go">Connect</button>
+</form>
 
 <nav>
   <button class="on" data-t="ask">Ask</button>
@@ -192,7 +196,21 @@
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const api = async (p, o) => { const r = await fetch(p, o); const j = await r.json(); if(!r.ok) throw new Error(j.detail || r.statusText); return j; };
+/* Every /api route needs the API credential. Kept for this tab only; asked for on first 401. */
+let TOKEN = ''; try { TOKEN = sessionStorage.getItem('fa_api_token') || ''; } catch(e) {}
+const apiToken = () => TOKEN;
+const api = async (p, o) => {
+  o = o || {}; o.headers = {...(o.headers||{}), 'Authorization': 'Bearer ' + apiToken()};
+  const r = await fetch(p, o);
+  if(r.status === 401){ $('#authbar').style.display = 'flex'; $('#apitok').focus(); }
+  const j = await r.json(); if(!r.ok) throw new Error(j.detail || r.statusText); return j;
+};
+function saveToken(ev){
+  ev.preventDefault();
+  TOKEN = $('#apitok').value.trim();
+  try { sessionStorage.setItem('fa_api_token', TOKEN); } catch(e) {}
+  $('#authbar').style.display = 'none'; boot();
+}
 const post = (p, b, h) => api(p, {method:'POST', headers:{'content-type':'application/json', ...(h||{})}, body:JSON.stringify(b||{})});
 const chip = (t, cls) => `<span class="chip ${cls||t}">${esc(t)}</span>`;
 const cites = arr => (arr||[]).map(c => `<span class="cite" onclick="openClaim('${c}')">${c}</span>`).join('');
@@ -383,7 +401,7 @@ async function loadContradictions(){
 let DOCS = null;
 async function loadDocuments(){
   if(!DOCS) DOCS = (await api('/api/documents')).documents;
-  $('#documents').innerHTML = `<div class="split"><div class="doclist" id="doclist">${DOCS.map(d => `<button onclick="showDoc('${d.doc_id}')"><span class="id">${d.doc_id}</span>${esc(d.title)}<br><span class="note">${d.doc_type} · ${d.authority} · ${d.date}${d.ledger_status?` · <span class="${d.ledger_status==='ACTIVE'?'ok':''}">${d.ledger_status}</span>`:''}</span></button>`).join('')}</div><div id="docview" class="card"><div class="empty">Select a document to see its claims and their labels.</div></div></div>`;
+  $('#documents').innerHTML = `<div class="split"><div class="doclist" id="doclist">${DOCS.map(d => `<button onclick="showDoc('${d.doc_id}')"><span class="id">${d.doc_id}</span>${esc(d.title)}<br><span class="note">${d.doc_type} · ${d.authority} via ${d.channel} · ${d.date}${d.quarantined?' · <span class="warn">QUARANTINED</span>':''}${d.ledger_status?` · <span class="${d.ledger_status==='ACTIVE'?'ok':''}">${d.ledger_status}</span>`:''}</span></button>`).join('')}</div><div id="docview" class="card"><div class="empty">Select a document to see its claims and their labels.</div></div></div>`;
 }
 async function showDoc(id, highlight){
   document.querySelectorAll('#doclist button').forEach(b => b.classList.toggle('on', b.textContent.startsWith(id)));
@@ -394,6 +412,8 @@ function docHtml(d, highlight){
   return `<div class="row" style="margin-bottom:4px"><b style="font-size:15px">${d.doc_id} — ${esc(d.title)}</b></div>
     <div class="row" style="margin-bottom:10px"><span class="pill">${d.doc_type}</span><span class="pill">${d.authority}</span><span class="pill">${d.date}</span>${d.ledger?chip(d.ledger.status):(d.declared_status?chip(d.declared_status):'')}${d.ledger&&d.declared_status&&d.declared_status!==d.ledger.status?`<span class="note">declared ${d.declared_status}</span>`:''}</div>
     <div class="note" style="margin-bottom:10px">${esc(d.source)}${d.superseded_by?` · superseded by <span class="cite" onclick="openDoc('${d.superseded_by}')">${d.superseded_by}</span>`:''}${d.supersedes&&d.supersedes.length?` · supersedes ${d.supersedes.map(x=>`<span class="cite" onclick="openDoc('${x}')">${x}</span>`).join('')}`:''}</div>
+    <div class="note" style="margin-bottom:10px">provenance: filed via <b>${esc(d.channel)}</b>${d.filed_by?` by ${esc(d.filed_by)}`:''} · authority assigned by channel: <b>${esc(d.authority)}</b>${d.declared_authority&&d.declared_authority!==d.authority?` (file declares ${esc(d.declared_authority)} — ignored)`:''} · release: ${esc(d.sensitivity)}</div>
+    ${(d.provenance_notes||[]).map(n=>`<div class="caveat">${esc(n)}</div>`).join('')}
     ${d.ledger && d.ledger.notes.length ? d.ledger.notes.map(n=>`<div class="caveat">${esc(n)}</div>`).join('') : ''}
     <h2 style="margin-top:14px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em">Claims</h2>
     ${d.claims.map(c => `<div class="claim ${c.claim_id===highlight?'hl':''}"><span class="id">${c.claim_id}</span><span>${chip(c.claim_type)}</span><div>${esc(c.text)}<div class="reason">${esc(c.type_reason)} · confidence ${c.type_confidence}${c.injection_flags.length?` · <span class="bad">flags: ${c.injection_flags.join(', ')}</span>`:''}</div></div></div>`).join('')}`;
@@ -431,29 +451,30 @@ function actionCard(a){
     <details style="margin-top:6px"><summary>message body</summary><pre>${esc(a.payload.body||'')}</pre></details>
     ${a.warnings.map(w => `<div class="caveat">${esc(w)}</div>`).join('')}
     ${a.execution_result ? `<pre>${esc(JSON.stringify(a.execution_result, null, 2))}</pre>` : ''}
-    ${pending ? `<div class="row" style="margin-top:10px"><input type="text" id="tok-${a.action_id}" placeholder="approver credential (dev: dev-human-console-token)" style="min-width:320px"><button class="go" onclick="approve('${a.action_id}')">Approve</button><button class="go danger" onclick="denyAct('${a.action_id}')">Deny</button></div><p class="note" style="margin:6px 0 0">Try approving with an empty or wrong credential — the gateway refuses before it reads the action.</p>` : ''}
-    ${a.status === 'APPROVED' ? `<div class="row" style="margin-top:10px"><button class="go" onclick="execAct('${a.action_id}')">Execute now</button><span class="note">re-hashes the payload; refuses if it changed since approval</span></div>` : ''}
+    ${pending ? `<div class="row" style="margin-top:10px"><input type="text" aria-label="approver credential" placeholder="approver credential (dev: dev-human-console-token)" style="min-width:320px"><button class="go" onclick="approve('${a.action_id}', this)">Approve</button><button class="go danger" onclick="denyAct('${a.action_id}', this)">Deny</button></div><p class="note" style="margin:6px 0 0">Try approving with an empty or wrong credential — the gateway refuses before it reads the action.</p>` : ''}
+    ${a.status === 'APPROVED' ? `<div class="row" style="margin-top:10px"><input type="text" aria-label="approver credential" placeholder="approver credential" style="min-width:240px"><button class="go" onclick="execAct('${a.action_id}', this)">Execute now</button><span class="note">needs the approver credential; re-hashes the payload and refuses if it changed since approval</span></div>` : ''}
   </div>`;
 }
-function refused(id, msg){
-  const card = $('#act-'+id); let box = card.querySelector('.refusal');
+function refused(card, msg){
+  let box = card.querySelector('.refusal');
   if(!box){ box = document.createElement('div'); box.className = 'missing refusal'; card.appendChild(box); }
   box.innerHTML = `<b>Gateway refused (HTTP 403):</b> ${esc(msg)} <span class="note">— logged as an authorization_violation</span>`;
 }
-async function actionCall(id, path, body, headers){
+/* Approve, deny and execute all present the approver credential - not just approve.
+   The same card renders on the Ask and Authorization tabs, so work on the clicked one. */
+async function actionCall(id, path, body, btn){
+  const card = btn.closest('.card');
+  const headers = {'X-Approver-Token': (btn.parentElement.querySelector('input')?.value || '').trim(), 'X-Approver-Id': 'founder'};
   try{
     const j = await post(`/api/actions/${id}/${path}`, body, headers);
-    $('#act-'+id).outerHTML = actionCard(j); boot();
+    card.outerHTML = actionCard(j); boot();
     if($('#actions').classList.contains('on')) loadActions();   // re-bucket pending / history
   }
-  catch(e){ refused(id, e.message); }
+  catch(e){ refused(card, e.message); }
 }
-function approve(id){
-  const token = $('#tok-'+id).value.trim();
-  actionCall(id, 'approve', {note:'approved from console'}, {'X-Approver-Token': token, 'X-Approver-Id': 'founder'});
-}
-const denyAct = id => actionCall(id, 'deny', {reason:'denied from console'});
-const execAct = id => actionCall(id, 'execute');
+const approve = (id, btn) => actionCall(id, 'approve', {note:'approved from console'}, btn);
+const denyAct = (id, btn) => actionCall(id, 'deny', {reason:'denied from console'}, btn);
+const execAct = (id, btn) => actionCall(id, 'execute', {}, btn);
 async function loadActions(){
   const d = await api('/api/actions');
   const pending = d.actions.filter(a => a.status === 'PENDING_HUMAN_AUTHORIZATION');

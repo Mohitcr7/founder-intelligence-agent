@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from ..schemas import Claim, ClaimType, DelegationRequest, DelegationResult
+from ..tools.registry import ToolPermissionError
 from .base import SubAgent
 
 _SYSTEM = """You are a research subagent for a founder's institutional memory.
@@ -36,8 +37,23 @@ class ResearchAgent(SubAgent):
             for c in items[:3]:
                 findings.append(f"[{ctype.value}] {c.text} ({c.claim_id}, {c.date})")
 
+        # The parent's top-k can miss the decision sentence of a document it did
+        # retrieve. Look for it - inside those same documents only, through the
+        # audited search tool, so the context is completed rather than widened.
+        searched: list[str] = []
+        if not buckets.get(ClaimType.DECISION) and claims and self.tools is not None:
+            try:
+                hits = self.call_tool("corpus.search", {
+                    "query": request.task, "types": [ClaimType.DECISION.value], "top_k": 3,
+                    "doc_ids": sorted({c.doc_id for c in claims})}, request.parent_trace_id)
+            except ToolPermissionError:
+                hits = {"results": []}
+            for h in hits.get("results", []):
+                searched.append(h["claim_id"])
+                findings.append(f"[DECISION] {h['text']} ({h['claim_id']}, found by corpus.search)")
+
         gaps: list[str] = []
-        if not buckets.get(ClaimType.DECISION):
+        if not buckets.get(ClaimType.DECISION) and not searched:
             gaps.append("No decision of record was found on this subject in the supplied set.")
         if buckets.get(ClaimType.HYPOTHESIS) and not buckets.get(ClaimType.FACT):
             gaps.append("Only untested hypotheses support this; no measured evidence was filed.")
@@ -60,7 +76,8 @@ class ResearchAgent(SubAgent):
                 f"{len(buckets.get(ClaimType.INFERENCE, []))} inferences, "
                 f"{len(buckets.get(ClaimType.HYPOTHESIS, []))} untested hypotheses."),
             findings=findings,
-            citations=[c.claim_id for c in claims],
+            citations=[c.claim_id for c in claims] + searched,
+            tool_claim_ids=searched,
             confidence=round(confidence, 2),
             provider=provider, model=model, tokens_used=tokens,
         )

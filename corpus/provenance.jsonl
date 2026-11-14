@@ -1,0 +1,18 @@
+{"doc_id": "DOC-01", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-01-12T00:00:00+00:00"}
+{"doc_id": "DOC-02", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-06-03T00:00:00+00:00"}
+{"doc_id": "DOC-03", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-02-20T00:00:00+00:00"}
+{"doc_id": "DOC-04", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-03-15T00:00:00+00:00", "sensitivity": "customer_shareable", "cleared_by": "compliance"}
+{"doc_id": "DOC-05", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-04-08T00:00:00+00:00", "sensitivity": "customer_shareable", "cleared_by": "compliance"}
+{"doc_id": "DOC-06", "channel": "finance", "filed_by": "seed-import", "received_at": "2026-07-22T00:00:00+00:00"}
+{"doc_id": "DOC-07", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-05-10T00:00:00+00:00"}
+{"doc_id": "DOC-08", "channel": "external", "filed_by": "seed-import", "received_at": "2026-01-15T00:00:00+00:00"}
+{"doc_id": "DOC-09", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-04-18T00:00:00+00:00"}
+{"doc_id": "DOC-10", "channel": "board", "filed_by": "seed-import", "received_at": "2026-07-30T00:00:00+00:00"}
+{"doc_id": "DOC-11", "channel": "compliance", "filed_by": "seed-import", "received_at": "2026-08-05T00:00:00+00:00", "sensitivity": "customer_shareable", "cleared_by": "compliance"}
+{"doc_id": "DOC-12", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-02-02T00:00:00+00:00"}
+{"doc_id": "DOC-13", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-06-14T00:00:00+00:00"}
+{"doc_id": "DOC-14", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-03-01T00:00:00+00:00"}
+{"doc_id": "DOC-15", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-04-25T00:00:00+00:00"}
+{"doc_id": "DOC-16", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-05-29T00:00:00+00:00"}
+{"doc_id": "DOC-17", "channel": "founder", "filed_by": "seed-import", "received_at": "2026-01-10T00:00:00+00:00"}
+{"doc_id": "DOC-18", "channel": "engineering", "filed_by": "seed-import", "received_at": "2026-06-20T00:00:00+00:00"}

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from founder_agent.app import build_system
-from founder_agent.config import ROOT, Settings
+
 from founder_agent.llm.base import LLMRequest, LLMResponse
 from founder_agent.schemas import ClaimType
 
@@ -34,18 +34,16 @@ class FakeProvider:
         item = self.script.pop(0) if self.script else "INSUFFICIENT_EVIDENCE"
         if isinstance(item, Exception):
             return LLMResponse("", self.name, self.model, error=str(item))
+        if isinstance(item, dict):          # a provider that honoured json_schema
+            return LLMResponse("", self.name, self.model, input_tokens=50, output_tokens=20,
+                               structured=item)
         return LLMResponse(item, self.name, self.model, input_tokens=50, output_tokens=20)
 
 
 @pytest.fixture()
-def hosted(tmp_path):
-    s = Settings()
-    s.corpus_dir = ROOT / "corpus"
-    s.audit_path = tmp_path / "audit.jsonl"
-    s.actions_path = tmp_path / "actions.jsonl"
-    s.role_routing = {role: ["fake", "deterministic"]
-                      for role in ("reason", "extract", "research", "redteam")}
-    s.ensure_dirs()
+def hosted(make_settings):
+    s = make_settings(role_routing={role: ["fake", "deterministic"]
+                                    for role in ("reason", "extract", "research", "redteam")})
     system = build_system(s)
     fake = FakeProvider()
     system.registry.register(fake)
@@ -176,3 +174,39 @@ def test_audit_attributes_the_answer_to_the_serving_model(hosted):
     assert calls[0]["provider"] == "fake"
     assert calls[0]["model"] == "fake-model-1"
     assert calls[0]["degraded"] is False
+
+
+def test_synthesis_asks_for_structured_output(hosted):
+    system, fake = hosted
+    fake.script = [{"sentences": [{"text": "Signing logs are kept for seven years.",
+                                   "claim_ids": ["DOC-14#c1"]}]}]
+    answer = system.knowledge.answer("How long do we keep signing logs?")
+    assert fake.requests[0].json_schema is not None
+    assert [(s.text, s.citations) for s in answer.segments] == [
+        ("Signing logs are kept for seven years.", ["DOC-14#c1"])]
+
+
+def test_structured_output_gets_the_same_citation_discipline(hosted):
+    system, fake = hosted
+    fake.script = [{"sentences": [
+        {"text": "Logs are kept seven years.", "claim_ids": ["DOC-14#c1"]},
+        {"text": "Backups live in Frankfurt.", "claim_ids": []},                 # uncited
+        {"text": "The regulator approved this.", "claim_ids": ["DOC-42#c9"]},    # invented id
+        {"text": "EU latency is caused by us-east-1.", "claim_ids": ["DOC-03#c1"]},
+    ]}]
+    answer = system.knowledge.answer("How long do we keep signing logs and why is EU slow?")
+    texts = [s.text for s in answer.segments]
+    assert "Backups live in Frankfurt." not in texts
+    assert "The regulator approved this." not in texts
+    hyp = [s for s in answer.segments if s.citations == ["DOC-03#c1"]]
+    assert not hyp or hyp[0].claim_type is ClaimType.HYPOTHESIS
+
+
+def test_local_model_registers_only_when_configured(make_settings):
+    assert "local" not in build_system(make_settings()).registry.status()
+    s = make_settings(local_url="http://127.0.0.1:11434/v1",
+                      role_routing={r: ["local", "deterministic"]
+                                    for r in ("reason", "extract", "research", "redteam")})
+    system = build_system(s)
+    assert system.registry.status()["local"]["available"] is True
+    assert system.registry.chain("reason") == ["local", "deterministic"]

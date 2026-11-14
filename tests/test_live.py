@@ -18,16 +18,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def live(tmp_path_factory):
+def live(make_settings):
     from founder_agent.app import build_system
-    from founder_agent.config import ROOT, Settings
-    tmp = tmp_path_factory.mktemp("live")
-    s = Settings()
-    s.corpus_dir = ROOT / "corpus"
-    s.audit_path = tmp / "audit.jsonl"
-    s.actions_path = tmp / "actions.jsonl"
-    s.ensure_dirs()
-    return build_system(s)
+    return build_system(make_settings())
 
 
 def test_anthropic_is_the_active_provider(live):
